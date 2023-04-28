@@ -20,10 +20,10 @@ def set_seed(seed=0):
     torch.backends.cudnn.deterministic = True
 
 
-def init_run(log_path, seed):
+def init_run(log_path, seed):#ファイル書き込み
     set_seed(seed)
     if not os.path.exists(log_path): os.mkdir(log_path)
-    f = open(os.path.join(log_path, 'log.txt'), 'w')
+    f = open(os.path.join(log_path, 'logy.txt'), 'w')
     f = Unbuffered(f)
     sys.stderr = f
     sys.stdout = f
@@ -38,7 +38,7 @@ def get_sparse_tensor(mat, device):
     return sp_tensor
 
 
-def generate_daj_mat(dataset):
+def generate_daj_mat(dataset): # Sparseなadj
     train_array = np.array(dataset.train_array)
     users, items = train_array[:, 0], train_array[:, 1]
     row = np.concatenate([users, items + dataset.n_users], axis=0)
@@ -48,8 +48,96 @@ def generate_daj_mat(dataset):
                             dtype=np.float32).tocsr()
     return adj_mat
 
+"""
+def generate_aug_daj_mat(dataset, aug_idx): # Sparseなadj
+    # generate adj matrix on aug-graph
+    train_array = np.array(dataset.train_array)
+    #train_array_def =train_array
+    aug_idx = np.array(aug_idx)
+    train_array = np.concatenate([train_array, aug_idx])
+    train_array.reshape(-1,2)
+    #train_array = np.unique(train_array)
+    
+    users, items = train_array[:, 0], train_array[:, 1]
+    row = np.concatenate([users, items + dataset.n_users], axis=0)
+    column = np.concatenate([items + dataset.n_users, users], axis=0)
+    adj_mat = sp.coo_matrix((np.ones(row.shape), np.stack([row, column], axis=0)),
+                            shape=(dataset.n_users + dataset.n_items, dataset.n_users + dataset.n_items),
+                            dtype=np.float32).tocsr()
+    return adj_mat
+"""
+
+def generate_aug_daj_mat(dataset, aug_idx): # Sparseなadj
+    # generate adj matrix on aug-graph
+    print(len(dataset.train_array))
+    aug_train_array = dataset.train_array
+    aug_train_array = aug_train_array.extend(aug_idx)
+    aug_train_array = list(map(list, set(map(tuple, aug_train_array))))
+    print(len(aug_train_array))
+    aug_train_array2 = np.array(aug_train_array)
+    print(len(aug_train_array2))
+    users, items = aug_train_array2[:, 0], aug_train_array2[:, 1]
+    row = np.concatenate([users, items + dataset.n_users], axis=0)
+    column = np.concatenate([items + dataset.n_users, users], axis=0)
+    adj_mat = sp.coo_matrix((np.ones(row.shape), np.stack([row, column], axis=0)),
+                            shape=(dataset.n_users + dataset.n_items, dataset.n_users + dataset.n_items),
+                            dtype=np.float32).tocsr()
+
+    del aug_train_array, aug_train_array2
+    torch.cuda.empty_cache()
+
+    return adj_mat
+
+
+def generate_drop_daj_mat(dataset, aug_rate): # Sparseなadj
+    # generate adj matrix on aug-graph
+    train_array = dataset.train_array
+    print(len(train_array))
+    train_array = random.sample(train_array, int(len(train_array)*aug_rate))
+    train_array = np.array(train_array)
+    print(len(train_array))
+    users, items = train_array[:, 0], train_array[:, 1]
+    row = np.concatenate([users, items + dataset.n_users], axis=0)
+    column = np.concatenate([items + dataset.n_users, users], axis=0)
+    adj_mat = sp.coo_matrix((np.ones(row.shape), np.stack([row, column], axis=0)),
+                            shape=(dataset.n_users + dataset.n_items, dataset.n_users + dataset.n_items),
+                            dtype=np.float32).tocsr()
+    return adj_mat
+
+def generate_drop_daj_mat2(dataset, aug_idx, aug_rate): # Sparseなadj
+    # generate adj matrix on aug-graph
+    train_array = dataset.train_array
+    train_array.extend(aug_idx)
+    train_array = list(map(list, set(map(tuple, train_array))))
+    random.sample(train_array, int(len(train_array)*0.5))
+    train_array = np.array(train_array)
+    users, items = train_array[:, 0], train_array[:, 1]
+    row = np.concatenate([users, items + dataset.n_users], axis=0)
+    column = np.concatenate([items + dataset.n_users, users], axis=0)
+    adj_mat = sp.coo_matrix((np.ones(row.shape), np.stack([row, column], axis=0)),
+                            shape=(dataset.n_users + dataset.n_items, dataset.n_users + dataset.n_items),
+                            dtype=np.float32).tocsr()
+    return adj_mat
+
+def generate_drop_daj_mat3(dataset, aug_idx): # Sparseなadj
+    # generate adj matrix on aug-graph
+    train_array = dataset.train_array
+    train_array = set(map(tuple, train_array))
+    aug_idx = set(map(tuple, aug_idx))
+    train_array_drop = list(map(list, train_array-aug_idx))
+    # train_array_drop = [i for i in train_array if i not in aug_idx]
+
+    train_array = np.array(train_array_drop)
+    users, items = train_array[:, 0], train_array[:, 1]
+    row = np.concatenate([users, items + dataset.n_users], axis=0)
+    column = np.concatenate([items + dataset.n_users, users], axis=0)
+    adj_mat = sp.coo_matrix((np.ones(row.shape), np.stack([row, column], axis=0)),
+                            shape=(dataset.n_users + dataset.n_items, dataset.n_users + dataset.n_items),
+                            dtype=np.float32).tocsr()
+    return adj_mat
 
 '''
+
 # This is for theoretical analysis.
 def greedy_or_sort(part_adj, u, ranking_metric, device):
     user_norm = np.linalg.norm(u, axis=1, ord=2) ** 2
@@ -93,6 +181,68 @@ def greedy_or_sort(part_adj, u, ranking_metric, device):
 
 def graph_rank_nodes(dataset, ranking_metric):
     adj_mat = generate_daj_mat(dataset)
+    if ranking_metric == 'degree':
+        user_metrics = np.array(np.sum(adj_mat[:dataset.n_users, :], axis=1)).squeeze()
+        item_metrics = np.array(np.sum(adj_mat[dataset.n_users:, :], axis=1)).squeeze()
+    elif ranking_metric == 'greedy' or ranking_metric == 'sort':
+        '''
+        # This is for theoretical analysis.
+        part_adj = adj_mat[:dataset.n_users, dataset.n_users:]
+        part_adj_tensor = get_sparse_tensor(part_adj, 'cpu')
+        with torch.no_grad():
+            u, s, v = torch.svd_lowrank(part_adj_tensor, 64)
+            u, v = u.numpy(), v.numpy()
+        user_metrics = greedy_or_sort(part_adj, u, ranking_metric, dataset.device)
+        item_metrics = greedy_or_sort(part_adj.T, v, ranking_metric, dataset.device)
+        '''
+        normalized_adj_mat = normalize(adj_mat, axis=1, norm='l1')
+        user_metrics = np.array(np.sum(normalized_adj_mat[:, :dataset.n_users], axis=0)).squeeze()
+        item_metrics = np.array(np.sum(normalized_adj_mat[:, dataset.n_users:], axis=0)).squeeze()
+    elif ranking_metric == 'page_rank':
+        g = nx.Graph()
+        g.add_edges_from(np.array(np.nonzero(adj_mat)).T)
+        pr = nx.pagerank(g)
+        pr = np.array([pr[i] for i in range(dataset.n_users + dataset.n_items)])
+        user_metrics, item_metrics = pr[:dataset.n_users], pr[dataset.n_users:]
+    else:
+        return None
+    ranked_users = np.argsort(user_metrics)[::-1].copy()
+    ranked_items = np.argsort(item_metrics)[::-1].copy()
+    return ranked_users, ranked_items
+
+def graph_aug_rank_nodes(dataset, ranking_metric, aug_idx):
+    adj_mat = generate_aug_daj_mat(dataset, aug_idx)
+    if ranking_metric == 'degree':
+        user_metrics = np.array(np.sum(adj_mat[:dataset.n_users, :], axis=1)).squeeze()
+        item_metrics = np.array(np.sum(adj_mat[dataset.n_users:, :], axis=1)).squeeze()
+    elif ranking_metric == 'greedy' or ranking_metric == 'sort':
+        '''
+        # This is for theoretical analysis.
+        part_adj = adj_mat[:dataset.n_users, dataset.n_users:]
+        part_adj_tensor = get_sparse_tensor(part_adj, 'cpu')
+        with torch.no_grad():
+            u, s, v = torch.svd_lowrank(part_adj_tensor, 64)
+            u, v = u.numpy(), v.numpy()
+        user_metrics = greedy_or_sort(part_adj, u, ranking_metric, dataset.device)
+        item_metrics = greedy_or_sort(part_adj.T, v, ranking_metric, dataset.device)
+        '''
+        normalized_adj_mat = normalize(adj_mat, axis=1, norm='l1')
+        user_metrics = np.array(np.sum(normalized_adj_mat[:, :dataset.n_users], axis=0)).squeeze()
+        item_metrics = np.array(np.sum(normalized_adj_mat[:, dataset.n_users:], axis=0)).squeeze()
+    elif ranking_metric == 'page_rank':
+        g = nx.Graph()
+        g.add_edges_from(np.array(np.nonzero(adj_mat)).T)
+        pr = nx.pagerank(g)
+        pr = np.array([pr[i] for i in range(dataset.n_users + dataset.n_items)])
+        user_metrics, item_metrics = pr[:dataset.n_users], pr[dataset.n_users:]
+    else:
+        return None
+    ranked_users = np.argsort(user_metrics)[::-1].copy()
+    ranked_items = np.argsort(item_metrics)[::-1].copy()
+    return ranked_users, ranked_items
+
+def graph_drop_rank_nodes(dataset, ranking_metric):
+    adj_mat = generate_drop_daj_mat(dataset)
     if ranking_metric == 'degree':
         user_metrics = np.array(np.sum(adj_mat[:dataset.n_users, :], axis=1)).squeeze()
         item_metrics = np.array(np.sum(adj_mat[dataset.n_users:, :], axis=1)).squeeze()

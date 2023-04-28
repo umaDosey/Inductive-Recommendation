@@ -9,7 +9,9 @@ from utils import AverageMeter, get_sparse_tensor
 import torch.nn.functional as F
 import scipy.sparse as sp
 from dataset import AuxiliaryDataset
-
+import csv
+from info_nce import InfoNCE
+prot_path = '../Result/k_prot.csv'
 
 def get_trainer(config, dataset, model):
     config = config.copy()
@@ -36,7 +38,6 @@ class BasicTrainer:
         self.best_ndcg = -np.inf
         self.save_path = None
         self.opt = None
-
         test_user = TensorDataset(torch.arange(self.dataset.n_users, dtype=torch.int64, device=self.device))
         self.test_user_loader = DataLoader(test_user, batch_size=trainer_config['test_batch_size'])
 
@@ -55,20 +56,21 @@ class BasicTrainer:
                                   , metrics[metric][k], self.epoch)
 
     def train(self, verbose=True, writer=None):
+        prot_results = []
         if not self.model.trainable:
             results, metrics = self.eval('val')
             if verbose:
                 print('Validation result. {:s}'.format(results))
-            ndcg = metrics['NDCG'][self.topks[0]]
+            ndcg = metrics['NDCG'][self.topks[5]]
             return ndcg
 
         if not os.path.exists('checkpoints'): os.mkdir('checkpoints')
         patience = self.max_patience
         for self.epoch in range(self.n_epochs):
             start_time = time.time()
-            self.model.train()
+            self.model.train() # train モード
             loss = self.train_one_epoch()
-            _, metrics = self.eval('train')
+            _, metrics, _ = self.eval('train')
             consumed_time = time.time() - start_time
             if verbose:
                 print('Epoch {:d}/{:d}, Loss: {:.6f}, Time: {:.3f}s'
@@ -81,14 +83,15 @@ class BasicTrainer:
                 continue
 
             start_time = time.time()
-            results, metrics = self.eval('val')
+            results, metrics, prot_result = self.eval('val')
+            prot_results.append(prot_result)
             consumed_time = time.time() - start_time
             if verbose:
                 print('Validation result. {:s}Time: {:.3f}s'.format(results, consumed_time))
             if writer:
                 self.record(writer, 'validation', metrics)
 
-            ndcg = metrics['NDCG'][self.topks[0]]
+            ndcg = metrics['NDCG'][self.topks[4]]
             if ndcg > self.best_ndcg:
                 if self.save_path:
                     os.remove(self.save_path)
@@ -103,6 +106,9 @@ class BasicTrainer:
                 if patience <= 0:
                     print('Early stopping!')
                     break
+        # csv書き込み
+
+
         self.model.load(self.save_path)
         return self.best_ndcg
 
@@ -170,41 +176,69 @@ class BasicTrainer:
         recall = ''
         ndcg = ''
         for k in self.topks:
-            precison += '{:.3f}%@{:d}, '.format(metrics['Precision'][k] * 100., k)
-            recall += '{:.3f}%@{:d}, '.format(metrics['Recall'][k] * 100., k)
-            ndcg += '{:.3f}%@{:d}, '.format(metrics['NDCG'][k] * 100., k)
+            precison += '{:.3f}, '.format(metrics['Precision'][k] * 100.)
+            recall += '{:.3f}, '.format(metrics['Recall'][k] * 100.)
+            ndcg += '{:.3f}, '.format(metrics['NDCG'][k] * 100.)
         results = 'Precision: {:s}Recall: {:s}NDCG: {:s}'.format(precison, recall, ndcg)
-        return results, metrics
+        
+        prot_precison = []
+        prot_recall = []
+        prot_ndcg = []
+        prot_results = []
+        """
+        for k in self.topks:
+            prot_precison += '{:.3f}'.format(metrics['Precision'][k] * 100.)
+            prot_recall += '{:.3f}'.format(metrics['Recall'][k] * 100.)
+            prot_ndcg += '{:.3f}'.format(metrics['NDCG'][k] * 100.)
+
+        prot_results = [prot_precison, prot_recall, prot_ndcg]
+        """
+        if val_or_test == 'test':
+            header = ['Precision', 'Recall', 'NDCG']
+            with open(prot_path, 'w') as file:
+                writer = csv.writer(file)
+                writer.writerow(header)
+               
+                for k in self.topks:
+                    # writer.writerows([k, k, k])
+                    prot_precison = (metrics['Precision'][k] * 100.)
+                    prot_recall = (metrics['Recall'][k] * 100.)
+                    prot_ndcg = (metrics['NDCG'][k] * 100.)
+                    prot_result = [prot_precison, prot_recall, prot_ndcg]
+                    writer.writerow(prot_result)
+            
+        return results, metrics, prot_results
 
     def inductive_eval(self, n_old_users, n_old_items):
         test_data = self.dataset.test_data.copy()
-
-        results, _ = self.eval('test')
+        flag = 1
+        results, _ , _ = self.eval('test')
         print('All users and all items result. {:s}'.format(results))
+        flag = 0
 
         for user in range(n_old_users, self.dataset.n_users):
             self.dataset.test_data[user] = []
-        results, _ = self.eval('test')
+        results, _, _ = self.eval('test')
         print('Old users and all items result. {:s}'.format(results))
 
         self.dataset.test_data = test_data.copy()
         for user in range(n_old_users):
             self.dataset.test_data[user] = []
-        results, _ = self.eval('test')
+        results, _, _  = self.eval('test')
         print('New users and all items result. {:s}'.format(results))
 
         self.dataset.test_data = test_data.copy()
         for user in range(self.dataset.n_users):
             test_items = np.array(self.dataset.test_data[user])
             self.dataset.test_data[user] = test_items[test_items < n_old_items].tolist()
-        results, _ = self.eval('test', banned_items=np.arange(n_old_items, self.dataset.n_items))
+        results, _, _ = self.eval('test', banned_items=np.arange(n_old_items, self.dataset.n_items))
         print('All users and old items result. {:s}'.format(results))
 
         self.dataset.test_data = test_data.copy()
         for user in range(self.dataset.n_users):
             test_items = np.array(self.dataset.test_data[user])
             self.dataset.test_data[user] = test_items[test_items >= n_old_items].tolist()
-        results, _ = self.eval('test', banned_items=np.arange(n_old_items))
+        results, _, _ = self.eval('test', banned_items=np.arange(n_old_items))
         print('All users and new items result. {:s}'.format(results))
 
         self.dataset.test_data = test_data.copy()
@@ -213,12 +247,158 @@ class BasicTrainer:
         for user in range(n_old_users):
             test_items = np.array(self.dataset.test_data[user])
             self.dataset.test_data[user] = test_items[test_items < n_old_items].tolist()
-        results, _ = self.eval('test', banned_items=np.arange(n_old_items, self.dataset.n_items))
+        results, _, _ = self.eval('test', banned_items=np.arange(n_old_items, self.dataset.n_items))
         print('Old users and old items result. {:s}'.format(results))
 
         self.dataset.test_data = test_data.copy()
 
+class DOSEaugTrainer(BasicTrainer):
+    def __init__(self, trainer_config):
+        super(DOSEaugTrainer, self).__init__(trainer_config)
 
+        self.dataloader = DataLoader(self.dataset, batch_size=trainer_config['batch_size'],
+                                     num_workers=trainer_config['dataloader_num_workers'])
+        self.aux_dataloader = DataLoader(AuxiliaryDataset(self.dataset, self.model.user_map, self.model.item_map),
+                                         batch_size=trainer_config['batch_size'],
+                                         num_workers=trainer_config['dataloader_num_workers'])
+        self.initialize_optimizer()
+        self.l2_reg = trainer_config['l2_reg']
+        self.aux_reg = trainer_config['aux_reg']
+        self.contrastive_reg = trainer_config['contrastive_reg']
+
+    def train_one_epoch(self): # lossの変更
+        losses = AverageMeter()
+        for batch_data, a_batch_data in zip(self.dataloader, self.aux_dataloader):
+            #start_time1 = time.time()
+            inputs = batch_data[:, 0, :].to(device=self.device, dtype=torch.int64)
+            users, pos_items, neg_items = inputs[:, 0],  inputs[:, 1],  inputs[:, 2]
+            users_r, pos_items_r, neg_items_r, l2_norm_sq, contrastive_loss = self.model.bpr_forward(users, pos_items, neg_items)
+            pos_scores = torch.sum(users_r * pos_items_r, dim=1)
+            neg_scores = torch.sum(users_r * neg_items_r, dim=1)
+            bpr_loss = F.softplus(neg_scores - pos_scores).mean()
+
+            inputs = a_batch_data[:, 0, :].to(device=self.device, dtype=torch.int64)
+            users, pos_items, neg_items = inputs[:, 0],  inputs[:, 1],  inputs[:, 2]
+            users_r = self.model.embedding(users)
+            pos_items_r = self.model.embedding(pos_items + len(self.model.user_map))
+            neg_items_r = self.model.embedding(neg_items + len(self.model.user_map))
+            pos_scores = torch.sum(users_r * pos_items_r * self.model.w[None, :], dim=1)
+            neg_scores = torch.sum(users_r * neg_items_r * self.model.w[None, :], dim=1)
+            aux_loss = F.softplus(neg_scores - pos_scores).mean()
+
+            reg_loss = self.l2_reg * l2_norm_sq.mean() + self.aux_reg * aux_loss + self.contrastive_reg * contrastive_loss.mean()
+            loss = bpr_loss + reg_loss
+            self.opt.zero_grad()
+            loss.backward()
+            self.opt.step()
+            losses.update(loss.item(), inputs.shape[0])
+            #consumed_time1 = time.time() - start_time1
+            #print(consumed_time1)
+
+        self.model.feat_mat_anneal()
+        # del self.model.norm_aug_adj
+
+        torch.cuda.empty_cache()
+
+        # self.model.norm_aug_adj = self.model.generate_aug_graph(self.config['dataset'])
+
+        return losses.avg
+class DOSEdropTrainer(BasicTrainer):
+    def __init__(self, trainer_config):
+        super(DOSEdropTrainer, self).__init__(trainer_config)
+
+        self.dataloader = DataLoader(self.dataset, batch_size=trainer_config['batch_size'],
+                                     num_workers=trainer_config['dataloader_num_workers'])
+        self.aux_dataloader = DataLoader(AuxiliaryDataset(self.dataset, self.model.user_map, self.model.item_map),
+                                         batch_size=trainer_config['batch_size'],
+                                         num_workers=trainer_config['dataloader_num_workers'])
+        self.initialize_optimizer()
+        self.l2_reg = trainer_config['l2_reg']
+        self.aux_reg = trainer_config['aux_reg']
+        self.contrastive_reg = trainer_config['contrastive_reg']
+
+    def train_one_epoch(self): # lossの変更
+        losses = AverageMeter()
+        for batch_data, a_batch_data in zip(self.dataloader, self.aux_dataloader):
+            #start_time1 = time.time()
+            inputs = batch_data[:, 0, :].to(device=self.device, dtype=torch.int64)
+            users, pos_items, neg_items = inputs[:, 0],  inputs[:, 1],  inputs[:, 2]
+            users_r, pos_items_r, neg_items_r, l2_norm_sq, contrastive_loss = self.model.bpr_forward(users, pos_items, neg_items)
+            pos_scores = torch.sum(users_r * pos_items_r, dim=1)
+            neg_scores = torch.sum(users_r * neg_items_r, dim=1)
+            bpr_loss = F.softplus(neg_scores - pos_scores).mean()
+
+            inputs = a_batch_data[:, 0, :].to(device=self.device, dtype=torch.int64)
+            users, pos_items, neg_items = inputs[:, 0],  inputs[:, 1],  inputs[:, 2]
+            users_r = self.model.embedding(users)
+            pos_items_r = self.model.embedding(pos_items + len(self.model.user_map))
+            neg_items_r = self.model.embedding(neg_items + len(self.model.user_map))
+            pos_scores = torch.sum(users_r * pos_items_r * self.model.w[None, :], dim=1)
+            neg_scores = torch.sum(users_r * neg_items_r * self.model.w[None, :], dim=1)
+            aux_loss = F.softplus(neg_scores - pos_scores).mean()
+
+            reg_loss = self.l2_reg * l2_norm_sq.mean() + self.aux_reg * aux_loss +self.contrastive_reg * contrastive_loss.mean()
+            loss = bpr_loss + reg_loss
+            self.opt.zero_grad()
+            loss.backward()
+            self.opt.step()
+            losses.update(loss.item(), inputs.shape[0])
+            #consumed_time1 = time.time() - start_time1
+            #print(consumed_time1)
+
+        self.model.feat_mat_anneal()
+        self.model.update_aug_adj()
+
+        return losses.avg
+
+class DOSEtestTrainer(BasicTrainer):
+    def __init__(self, trainer_config):
+        super(DOSEtestTrainer, self).__init__(trainer_config)
+
+        self.dataloader = DataLoader(self.dataset, batch_size=trainer_config['batch_size'],
+                                     num_workers=trainer_config['dataloader_num_workers'])
+        self.aux_dataloader = DataLoader(AuxiliaryDataset(self.dataset, self.model.user_map, self.model.item_map),
+                                         batch_size=trainer_config['batch_size'],
+                                         num_workers=trainer_config['dataloader_num_workers'])
+        self.initialize_optimizer()
+        self.l2_reg = trainer_config['l2_reg']
+        self.aux_reg = trainer_config['aux_reg']
+        self.contrastive_reg = trainer_config['contrastive_reg']
+
+    def train_one_epoch(self):  # lossの変更
+        losses = AverageMeter()
+        for batch_data, a_batch_data in zip(self.dataloader, self.aux_dataloader):
+            # start_time1 = time.time()
+            inputs = batch_data[:, 0, :].to(device=self.device, dtype=torch.int64)
+            users, pos_items, neg_items = inputs[:, 0], inputs[:, 1], inputs[:, 2]
+            users_r, pos_items_r, neg_items_r, l2_norm_sq, contrastive_loss = self.model.bpr_forward(users, pos_items,
+                                                                                                     neg_items)
+            pos_scores = torch.sum(users_r * pos_items_r, dim=1)
+            neg_scores = torch.sum(users_r * neg_items_r, dim=1)
+            bpr_loss = F.softplus(neg_scores - pos_scores).mean()
+
+            inputs = a_batch_data[:, 0, :].to(device=self.device, dtype=torch.int64)
+            users, pos_items, neg_items = inputs[:, 0], inputs[:, 1], inputs[:, 2]
+            users_r = self.model.embedding(users)
+            pos_items_r = self.model.embedding(pos_items + len(self.model.user_map))
+            neg_items_r = self.model.embedding(neg_items + len(self.model.user_map))
+            pos_scores = torch.sum(users_r * pos_items_r * self.model.w[None, :], dim=1)
+            neg_scores = torch.sum(users_r * neg_items_r * self.model.w[None, :], dim=1)
+            aux_loss = F.softplus(neg_scores - pos_scores).mean()
+
+            reg_loss = self.l2_reg * l2_norm_sq.mean() + self.aux_reg * aux_loss + self.contrastive_reg * contrastive_loss.mean()
+            loss = bpr_loss + reg_loss
+            self.opt.zero_grad()
+            loss.backward()
+            self.opt.step()
+            losses.update(loss.item(), inputs.shape[0])
+            # consumed_time1 = time.time() - start_time1
+            # print(consumed_time1)
+
+        self.model.feat_mat_anneal()
+        self.model.update_aug_adj()
+
+        return losses.avg
 class BPRTrainer(BasicTrainer):
     def __init__(self, trainer_config):
         super(BPRTrainer, self).__init__(trainer_config)
@@ -248,6 +428,62 @@ class BPRTrainer(BasicTrainer):
         return losses.avg
 
 
+class SGLTrainer(BasicTrainer):
+    def __init__(self, trainer_config):
+        super(SGLTrainer, self).__init__(trainer_config)
+
+        self.dataloader = DataLoader(self.dataset, batch_size=trainer_config['batch_size'],
+                                     num_workers=trainer_config['dataloader_num_workers'])
+        self.initialize_optimizer()
+        self.l2_reg = trainer_config['l2_reg']
+        self.contrastive_reg = trainer_config['contrastive_reg']
+    def train_one_epoch(self):
+        losses = AverageMeter()
+        for batch_data in self.dataloader:
+            inputs = batch_data[:, 0, :].to(device=self.device, dtype=torch.int64)
+            users, pos_items, neg_items = inputs[:, 0],  inputs[:, 1],  inputs[:, 2]
+
+            users_r, pos_items_r, neg_items_r, l2_norm_sq, contrastive_loss = self.model.bpr_forward(users, pos_items, neg_items)
+            pos_scores = torch.sum(users_r * pos_items_r, dim=1)
+            neg_scores = torch.sum(users_r * neg_items_r, dim=1)
+
+            bpr_loss = F.softplus(neg_scores - pos_scores).mean()
+            reg_loss = self.l2_reg * l2_norm_sq.mean()
+            loss = bpr_loss + reg_loss + self.contrastive_reg * contrastive_loss.mean()
+            self.opt.zero_grad()
+            loss.backward()
+            self.opt.step()
+            losses.update(loss.item(), inputs.shape[0])
+            self.model.update_aug_adj()
+        return losses.avg
+class HALFTrainer(BasicTrainer):
+    def __init__(self, trainer_config):
+        super(HALFTrainer, self).__init__(trainer_config)
+
+        self.dataloader = DataLoader(self.dataset, batch_size=trainer_config['batch_size'],
+                                     num_workers=trainer_config['dataloader_num_workers'])
+        self.initialize_optimizer()
+        self.l2_reg = trainer_config['l2_reg']
+        self.contrastive_reg = trainer_config['contrastive_reg']
+    def train_one_epoch(self):
+        losses = AverageMeter()
+        for batch_data in self.dataloader:
+            inputs = batch_data[:, 0, :].to(device=self.device, dtype=torch.int64)
+            users, pos_items, neg_items = inputs[:, 0],  inputs[:, 1],  inputs[:, 2]
+
+            users_r, pos_items_r, neg_items_r, l2_norm_sq, contrastive_loss = self.model.bpr_forward(users, pos_items, neg_items)
+            pos_scores = torch.sum(users_r * pos_items_r, dim=1)
+            neg_scores = torch.sum(users_r * neg_items_r, dim=1)
+
+            bpr_loss = F.softplus(neg_scores - pos_scores).mean()
+            reg_loss = self.l2_reg * l2_norm_sq.mean()
+            loss = bpr_loss + reg_loss + self.contrastive_reg * contrastive_loss.mean()
+            self.opt.zero_grad()
+            loss.backward()
+            self.opt.step()
+            losses.update(loss.item(), inputs.shape[0])
+            self.model.update_aug_adj()
+        return losses.avg
 class IDCFTrainer(BasicTrainer):
     def __init__(self, trainer_config):
         super(IDCFTrainer, self).__init__(trainer_config)
@@ -294,6 +530,7 @@ class IGCNTrainer(BasicTrainer):
     def train_one_epoch(self):
         losses = AverageMeter()
         for batch_data, a_batch_data in zip(self.dataloader, self.aux_dataloader):
+            #start_time1 = time.time()
             inputs = batch_data[:, 0, :].to(device=self.device, dtype=torch.int64)
             users, pos_items, neg_items = inputs[:, 0],  inputs[:, 1],  inputs[:, 2]
             users_r, pos_items_r, neg_items_r, l2_norm_sq = self.model.bpr_forward(users, pos_items, neg_items)
@@ -316,7 +553,10 @@ class IGCNTrainer(BasicTrainer):
             loss.backward()
             self.opt.step()
             losses.update(loss.item(), inputs.shape[0])
+            #consumed_time1 = time.time() - start_time1
+            #print(consumed_time1)
         self.model.feat_mat_anneal()
+
         return losses.avg
 
 

@@ -11,8 +11,12 @@ from torch.utils.checkpoint import checkpoint
 import dgl
 import multiprocessing as mp
 import time
-
-
+from info_nce import InfoNCE
+from sklearn.metrics.pairwise import cosine_similarity
+from torchmetrics.functional import pairwise_cosine_similarity
+from utils import generate_aug_daj_mat, generate_drop_daj_mat, graph_aug_rank_nodes, graph_drop_rank_nodes, generate_drop_daj_mat2, generate_drop_daj_mat3
+import random
+import gc
 def get_model(config, dataset):
     config = config.copy()
     config['dataset'] = dataset
@@ -79,14 +83,14 @@ class LightGCN(BasicModel):
         self.n_layers = model_config['n_layers']
         self.embedding = nn.Embedding(self.n_users + self.n_items, self.embedding_size)
         self.norm_adj = self.generate_graph(model_config['dataset'])
-        normal_(self.embedding.weight, std=0.1)
+        normal_(self.embedding.weight, std=0.1) # weightの初期化
         self.to(device=self.device)
 
     def generate_graph(self, dataset):
         adj_mat = generate_daj_mat(dataset)
         degree = np.array(np.sum(adj_mat, axis=1)).squeeze()
         degree = np.maximum(1., degree)
-        d_inv = np.power(degree, -0.5)
+        d_inv = np.power(degree, -0.5) # 累乗
         d_mat = sp.diags(d_inv, format='csr', dtype=np.float32)
 
         norm_adj = d_mat.dot(adj_mat).dot(d_mat)
@@ -121,6 +125,3727 @@ class LightGCN(BasicModel):
         all_items_r = rep[self.n_users:, :]
         scores = torch.mm(users_r, all_items_r.t())
         return scores
+
+
+class SGL(BasicModel):
+    def __init__(self, model_config):
+        super(SGL, self).__init__(model_config)
+        self.embedding_size = model_config['embedding_size']
+        self.n_layers = model_config['n_layers']
+        # self.dropout = model_config['dropout']
+        # self.feature_ratio = model_config['feature_ratio']  # Template%
+        self.norm_adj = self.generate_graph(model_config['dataset'])
+
+        self.alpha = 1.
+        self.delta = model_config.get('delta', 0.99)
+        self.taugh = model_config.get('taugh', 0.2)
+        self.aug_rate = model_config.get('aug_rate', 0.8)
+        # self.aug_num = model_config['aug_num']
+        # self.aug_num = int(self.aug_num)
+        # self.temper = model_config['temper']
+        # self.update_feat_mat()
+        # self.norm_aug_adj = generate_aug_graph(model_config['dataset'] )
+        self.embedding = nn.Embedding(self.n_users + self.n_items, self.embedding_size)
+
+        # self.w = nn.Parameter(torch.ones([self.embedding_size], dtype=torch.float32, device=self.device))
+        normal_(self.embedding.weight, std=0.1)
+        self.to(device=self.device)
+        self.norm_aug_adj1 = self.generate_drop_graph(model_config['dataset'])
+        self.norm_aug_adj2 = self.generate_drop_graph(model_config['dataset'])
+        self.times = model_config.get('times', 0)
+
+    def generate_graph(self, dataset):
+        adj_mat = generate_daj_mat(dataset)
+        degree = np.array(np.sum(adj_mat, axis=1)).squeeze()
+        degree = np.maximum(1., degree)
+        d_inv = np.power(degree, -0.5) # 累乗
+        d_mat = sp.diags(d_inv, format='csr', dtype=np.float32)
+
+        norm_adj = d_mat.dot(adj_mat).dot(d_mat)
+        norm_adj = get_sparse_tensor(norm_adj, self.device)
+        return norm_adj
+    def generate_drop_graph(self, dataset):
+        # new graph after adding some interactions
+        aug_adj_mat = generate_drop_daj_mat(dataset, aug_rate=self.aug_rate)
+        degree = np.array(np.sum(aug_adj_mat, axis=1)).squeeze()
+        degree = np.maximum(1., degree)
+        d_inv = np.power(degree, -0.5)  # 累乗
+        d_mat = sp.diags(d_inv, format='csr', dtype=np.float32)
+
+        norm_aug_adj = d_mat.dot(aug_adj_mat).dot(d_mat)
+        norm_aug_adj = get_sparse_tensor(norm_aug_adj, self.device)
+        return norm_aug_adj
+
+    def get_rep(self):
+        representations = self.embedding.weight
+        all_layer_rep = [representations]
+        row, column = self.norm_adj.indices()
+        g = dgl.graph((column, row), num_nodes=self.norm_adj.shape[0], device=self.device)
+        for _ in range(self.n_layers):
+            representations = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=representations, rhs_data=self.norm_adj.values())
+            all_layer_rep.append(representations)
+        all_layer_rep = torch.stack(all_layer_rep, dim=0)
+        final_rep = all_layer_rep.mean(dim=0)
+        return final_rep
+    def get_aug_rep(self, norm_aug_adj):
+        # generate final embedding on aug-graph
+        representations = self.embedding.weight
+        all_layer_rep = [representations]
+        row, column = norm_aug_adj.indices()
+        g = dgl.graph((column, row), num_nodes=norm_aug_adj.shape[0], device=self.device)
+        for _ in range(self.n_layers):
+            representations = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=representations, rhs_data=norm_aug_adj.values())
+            all_layer_rep.append(representations)
+        all_layer_rep = torch.stack(all_layer_rep, dim=0)
+        final_rep = all_layer_rep.mean(dim=0)
+        return final_rep
+
+    def cal_loss(self, users_r, aug_users_r):
+        # calcrate ssl-loss(InfoNCE)
+        loss = InfoNCE(negative_mode='unpaired')
+
+        query = users_r
+        positive_key = aug_users_r
+        negative_keys = aug_users_r
+        contrasive_loss = loss(query, positive_key, negative_keys)
+        return contrasive_loss
+
+    def bpr_forward(self, users, pos_items, neg_items):
+        # 普通の埋め込み
+        rep = self.get_rep()
+        users_r = rep[users, :]
+        pos_items_r, neg_items_r = rep[self.n_users + pos_items, :], rep[self.n_users + neg_items, :]
+        # AUG後の埋め込み
+
+        aug_rep1 = self.get_aug_rep(self.norm_aug_adj1)
+        aug_users_r1 = aug_rep1[users, :]
+        aug_rep2 = self.get_aug_rep(self.norm_aug_adj2)
+        aug_users_r2 = aug_rep2[users, :]
+        l2_norm_sq = torch.norm(users_r, p=2, dim=1) ** 2 + torch.norm(pos_items_r, p=2, dim=1) ** 2 \
+                     + torch.norm(neg_items_r, p=2, dim=1) ** 2
+        # Contrasive loss
+        contrasive_loss = self.cal_loss(aug_users_r1, aug_users_r2)
+        return users_r, pos_items_r, neg_items_r, l2_norm_sq, contrasive_loss
+
+
+
+    def update_aug_adj(self):
+        del self.norm_aug_adj1, self.norm_aug_adj2
+        torch.cuda.empty_cache()
+        # gc.collect()
+        self.norm_aug_adj1 = self.generate_drop_graph(self.config['dataset'])
+        self.norm_aug_adj2 = self.generate_drop_graph(self.config['dataset'])
+
+    def predict(self, users):
+        rep = self.get_rep()
+        users_r = rep[users, :]
+        all_items_r = rep[self.n_users:, :]
+        scores = torch.mm(users_r, all_items_r.t())
+        return scores
+
+class HALF(BasicModel):
+    def __init__(self, model_config):
+        super(HALF, self).__init__(model_config)
+        self.embedding_size = model_config['embedding_size']
+        self.n_layers = model_config['n_layers']
+        # self.dropout = model_config['dropout']
+        # self.feature_ratio = model_config['feature_ratio']  # Template%
+        self.norm_adj = self.generate_graph(model_config['dataset'])
+
+        self.alpha = 1.
+        self.delta = model_config.get('delta', 0.99)
+        self.taugh = model_config.get('taugh', 0.2)
+        self.aug_rate = model_config.get('aug_rate', 0.8)
+        # self.aug_num = model_config['aug_num']
+        # self.aug_num = int(self.aug_num)
+        # self.temper = model_config['temper']
+        # self.update_feat_mat()
+        # self.norm_aug_adj = generate_aug_graph(model_config['dataset'] )
+        self.embedding = nn.Embedding(self.n_users + self.n_items, self.embedding_size)
+
+        # self.w = nn.Parameter(torch.ones([self.embedding_size], dtype=torch.float32, device=self.device))
+        normal_(self.embedding.weight, std=0.1)
+        self.to(device=self.device)
+        self.norm_aug_adj1 = self.generate_drop_graph(model_config['dataset'])
+        # self.norm_aug_adj2 = self.generate_drop_graph(model_config['dataset'])
+        self.times = model_config.get('times', 0)
+
+    def generate_graph(self, dataset):
+        adj_mat = generate_daj_mat(dataset)
+        degree = np.array(np.sum(adj_mat, axis=1)).squeeze()
+        degree = np.maximum(1., degree)
+        d_inv = np.power(degree, -0.5) # 累乗
+        d_mat = sp.diags(d_inv, format='csr', dtype=np.float32)
+
+        norm_adj = d_mat.dot(adj_mat).dot(d_mat)
+        norm_adj = get_sparse_tensor(norm_adj, self.device)
+        return norm_adj
+    def generate_drop_graph(self, dataset):
+        # new graph after adding some interactions
+        aug_adj_mat = generate_drop_daj_mat(dataset, aug_rate=self.aug_rate)
+        degree = np.array(np.sum(aug_adj_mat, axis=1)).squeeze()
+        degree = np.maximum(1., degree)
+        d_inv = np.power(degree, -0.5)  # 累乗
+        d_mat = sp.diags(d_inv, format='csr', dtype=np.float32)
+
+        norm_aug_adj = d_mat.dot(aug_adj_mat).dot(d_mat)
+        norm_aug_adj = get_sparse_tensor(norm_aug_adj, self.device)
+        return norm_aug_adj
+
+    def get_rep(self):
+        representations = self.embedding.weight
+        all_layer_rep = [representations]
+        row, column = self.norm_adj.indices()
+        g = dgl.graph((column, row), num_nodes=self.norm_adj.shape[0], device=self.device)
+        for _ in range(self.n_layers):
+            representations = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=representations, rhs_data=self.norm_adj.values())
+            all_layer_rep.append(representations)
+        all_layer_rep = torch.stack(all_layer_rep, dim=0)
+        final_rep = all_layer_rep.mean(dim=0)
+        return final_rep
+    def get_aug_rep(self, norm_aug_adj):
+        # generate final embedding on aug-graph
+
+        representations = self.embedding.weight
+        all_layer_rep = [representations]
+        row, column = norm_aug_adj.indices()
+        g = dgl.graph((column, row), num_nodes=norm_aug_adj.shape[0], device=self.device)
+        for _ in range(self.n_layers):
+            representations = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=representations, rhs_data=norm_aug_adj.values())
+            all_layer_rep.append(representations)
+        all_layer_rep = torch.stack(all_layer_rep, dim=0)
+        final_rep = all_layer_rep.mean(dim=0)
+        return final_rep
+
+    def cal_loss(self, users_r, aug_users_r):
+        # calcrate ssl-loss(InfoNCE)
+        loss = InfoNCE(negative_mode='unpaired')
+        # print(users_r.size())
+        # print(aug_users_r.size())
+        query = users_r
+        positive_key = aug_users_r
+        negative_keys = aug_users_r
+        contrasive_loss = loss(query, positive_key, negative_keys)
+        return contrasive_loss
+
+    def bpr_forward(self, users, pos_items, neg_items):
+        # 普通の埋め込み
+        rep = self.get_rep()
+        users_r = rep[users, :]
+        pos_items_r, neg_items_r = rep[self.n_users + pos_items, :], rep[self.n_users + neg_items, :]
+        # AUG後の埋め込み
+
+        aug_rep1 = self.get_aug_rep(self.norm_aug_adj1)
+        aug_users_r1 = aug_rep1[users, :]
+        """
+        aug_rep2 = self.get_aug_rep(self.norm_aug_adj2)
+        aug_users_r2 = aug_rep2[users, :]
+        """
+        l2_norm_sq = torch.norm(users_r, p=2, dim=1) ** 2 + torch.norm(pos_items_r, p=2, dim=1) ** 2 \
+                     + torch.norm(neg_items_r, p=2, dim=1) ** 2
+        # Contrasive loss
+        contrasive_loss = self.cal_loss(users_r, aug_users_r1)
+        return users_r, pos_items_r, neg_items_r, l2_norm_sq, contrasive_loss
+
+
+
+    def update_aug_adj(self):
+        del self.norm_aug_adj1, # self.norm_aug_adj2
+        torch.cuda.empty_cache()
+        # gc.collect()
+        self.norm_aug_adj1 = self.generate_drop_graph(self.config['dataset'])
+        # self.norm_aug_adj2 = self.generate_drop_graph(self.config['dataset'])
+
+    def predict(self, users):
+        rep = self.get_rep()
+        users_r = rep[users, :]
+        all_items_r = rep[self.n_users:, :]
+        scores = torch.mm(users_r, all_items_r.t())
+        return scores
+
+class DOSE_aug(BasicModel):
+    def __init__(self, model_config):
+        super(DOSE_aug, self).__init__(model_config)
+        self.embedding_size = model_config['embedding_size']
+        self.n_layers = model_config['n_layers']
+        self.dropout = model_config['dropout']
+        self.feature_ratio = model_config['feature_ratio']  # Template%
+        self.norm_adj = self.generate_graph(model_config['dataset'])
+
+        self.alpha = 1.
+        self.delta = model_config.get('delta', 0.99)
+        self.taugh = model_config.get('taugh', 0.2)
+        self.aug_num = model_config['aug_num']
+        # self.temper = model_config['temper']
+        self.feat_mat, self.user_map, self.item_map, self.row_sum = \
+            self.generate_feat(model_config['dataset'],
+                               ranking_metric=model_config.get('ranking_metric', 'sort'))
+        self.update_feat_mat()
+        # self.norm_aug_adj = enerate_aug_graph(model_config['dataset'] )
+        self.embedding = nn.Embedding(self.feat_mat.shape[1], self.embedding_size)
+
+        self.w = nn.Parameter(torch.ones([self.embedding_size], dtype=torch.float32, device=self.device))
+        normal_(self.embedding.weight, std=0.1)
+        self.to(device=self.device)
+        self.norm_aug_adj = self.generate_aug_graph(model_config['dataset'])
+        self.times = model_config.get('times', 0.1)
+        # self.aug_num = (self.times) * len(self.feat_mat)
+
+    def update_feat_mat(self):
+        row, _ = self.feat_mat.indices()
+        edge_values = torch.pow(self.row_sum[row], (self.alpha - 1.) / 2. - 0.5)
+        self.feat_mat = torch.sparse.FloatTensor(self.feat_mat.indices(), edge_values, self.feat_mat.shape).coalesce()
+
+
+    def feat_mat_anneal(self):
+        self.alpha *= self.delta
+        self.update_feat_mat()
+
+    def generate_graph(self, dataset):
+        return LightGCN.generate_graph(self, dataset)
+
+    def generate_aug_graph(self, dataset):
+        # new graph after adding some interactions
+        aug_idx = self.cal_cos_sim()
+        aug_adj_mat = generate_aug_daj_mat(dataset, aug_idx)
+        degree = np.array(np.sum(aug_adj_mat, axis=1)).squeeze()
+        degree = np.maximum(1., degree)
+        d_inv = np.power(degree, -0.5) # 累乗
+        d_mat = sp.diags(d_inv, format='csr', dtype=np.float32)
+
+        norm_aug_adj = d_mat.dot(aug_adj_mat).dot(d_mat)
+        norm_aug_adj = get_sparse_tensor(norm_aug_adj, self.device)
+        return norm_aug_adj
+
+    def generate_feat(self, dataset, is_updating=False, ranking_metric=None):
+        # return adj matrix with template
+        if not is_updating:
+            if self.feature_ratio < 1.:  # ランク付後にスライス
+
+                ranked_users, ranked_items = graph_rank_nodes(dataset, ranking_metric)
+                core_users = ranked_users[:int(self.n_users * self.feature_ratio)]
+                core_items = ranked_items[:int(self.n_items * self.feature_ratio)]
+            else:
+                core_users = np.arange(self.n_users, dtype=np.int64)
+                core_items = np.arange(self.n_items, dtype=np.int64)
+
+            user_map = dict()
+            for idx, user in enumerate(core_users):
+                user_map[user] = idx
+            item_map = dict()
+            for idx, item in enumerate(core_items):
+                item_map[item] = idx
+        else:
+            user_map = self.user_map
+            item_map = self.item_map
+
+        user_dim, item_dim = len(user_map), len(item_map)
+        indices = []
+        for user, item in dataset.train_array:
+            if item in item_map:
+                indices.append([user, user_dim + item_map[item]])
+            if user in user_map:
+                indices.append([self.n_users + item, user_map[user]])
+        for user in range(self.n_users):
+            indices.append([user, user_dim + item_dim])
+        for item in range(self.n_items):
+            indices.append([self.n_users + item, user_dim + item_dim + 1])
+        feat = sp.coo_matrix((np.ones((len(indices),)), np.array(indices).T),
+                             shape=(self.n_users + self.n_items, user_dim + item_dim + 2), dtype=np.float32).tocsr()
+        row_sum = torch.tensor(np.array(np.sum(feat, axis=1)).squeeze(), dtype=torch.float32, device=self.device)
+        feat = get_sparse_tensor(feat, self.device)
+        return feat, user_map, item_map, row_sum
+
+    def inductive_rep_layer(self, feat_mat):
+        padding_tensor = torch.empty([max(self.feat_mat.shape) - self.feat_mat.shape[1], self.embedding_size],
+                                     dtype=torch.float32, device=self.device)
+        padding_features = torch.cat([self.embedding.weight, padding_tensor], dim=0)
+
+        row, column = feat_mat.indices()
+        g = dgl.graph((column, row), num_nodes=max(self.feat_mat.shape), device=self.device)
+        x = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=padding_features, rhs_data=feat_mat.values())
+        x = x[:self.feat_mat.shape[0], :]
+        return x
+
+
+    def get_def_rep(self):
+        # generate final embedding
+        feat_mat = NGCF.dropout_sp_mat(self, self.feat_mat)
+        representations = self.inductive_rep_layer(feat_mat)
+
+        all_layer_rep = [representations]
+        row, column = self.norm_adj.indices()
+        g = dgl.graph((column, row), num_nodes=self.norm_adj.shape[0], device=self.device)
+        for _ in range(self.n_layers):
+            representations = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=representations, rhs_data=self.norm_adj.values())
+            all_layer_rep.append(representations)
+        all_layer_rep = torch.stack(all_layer_rep, dim=0)
+        final_rep = all_layer_rep.mean(dim=0)
+        return final_rep
+
+    def get_aug_rep(self, norm_aug_adj):
+        # generate final embedding on aug-graph
+        feat_mat = NGCF.dropout_sp_mat(self, self.feat_mat)
+        representations = self.inductive_rep_layer(feat_mat)
+        
+        all_layer_rep = [representations]
+        row, column = norm_aug_adj.indices()
+        g = dgl.graph((column, row), num_nodes=norm_aug_adj.shape[0], device=self.device)
+        for _ in range(self.n_layers):
+            representations = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=representations, rhs_data=norm_aug_adj.values())
+            all_layer_rep.append(representations)
+        all_layer_rep = torch.stack(all_layer_rep, dim=0)
+        final_rep = all_layer_rep.mean(dim=0)
+        return final_rep
+
+    def cal_cos_sim(self):
+        # calculate cosine similarity with user embeddings and item embeddings (on CPU)
+        rep = self.get_def_rep()
+        all_users_r = rep[:self.n_users, :]
+        all_items_r = rep[self.n_users:, :]
+        
+        all_user_r = all_users_r.to('cpu').detach().numpy().copy()
+        all_item_r = all_items_r.to('cpu').detach().numpy().copy()
+        
+        x = cosine_similarity(all_user_r, all_item_r)
+
+        del all_users_r, all_items_r
+        del all_user_r, all_item_r
+        torch.cuda.empty_cache()
+
+        cos_mat = torch.from_numpy(x.astype(np.float32)).clone()
+        cos_mat.to(device=self.device)
+        cos_mat = torch.reshape(cos_mat, (1, -1))
+        cos_mat = torch.squeeze(cos_mat)
+        cos_mat1 = cos_mat[:len(cos_mat)//2]
+        _, idx1 = torch.topk(cos_mat1, self.aug_num//2)
+        cos_mat2 = cos_mat[len(cos_mat)//2:]
+
+        del cos_mat
+        torch.cuda.empty_cache()
+        # gc.collect()
+        print(len(cos_mat2))
+        _, idx2 = torch.topk(cos_mat2, self.aug_num//2)
+        #idx = idx.tolist()S
+        aug_idx1 = [[int(torch.div(idx1[i], self.n_items, rounding_mode='floor')),
+                     (int(torch.fmod(idx1[i], self.n_items)))] for i in range(self.aug_num//2)]
+        # aug_idx.to(device=self.device)
+        aug_idx2 = [
+            [int(torch.div(idx2[i]+self.aug_num//2, self.n_items, rounding_mode='floor')), (int(torch.fmod(idx2[i]+self.aug_num//2, self.n_items)))] for i
+            in range(self.aug_num//2)]
+        aug_idx1.extend(aug_idx2)
+        return aug_idx1  # return list [user_id, item_id]
+    
+    def cal_cos_sim_v2(self):
+        # calculate cosine similarity with user embeddings and item embeddings (on GPU)
+        rep = self.get_def_rep()
+        all_users_r = rep[:self.n_users, :]
+        all_items_r = rep[self.n_users:, :]
+        
+        cos_sim = pairwise_cosine_similarity(all_users_r, all_items_r)
+        cos_sim = torch.reshape(cos_sim, (1, -1))
+        _, idx = torch.topk(cos_sim, self.aug_num)
+        aug_idx = [[int(torch.div(idx[0][i], self.n_items, rounding_mode='floor')),
+                    (int(torch.fmod(idx[0][i], self.n_items)))] for i in range(self.aug_num)]
+
+        return aug_idx  # return list [user_id, item_id]
+
+
+    def cal_loss(self, users_r, aug_users_r):
+        # calcrate ssl-loss(InfoNCE)
+        loss = InfoNCE(negative_mode='unpaired')
+
+        query = users_r
+        positive_key = aug_users_r
+        negative_keys = aug_users_r
+        contrasive_loss = loss(query, positive_key, negative_keys)
+        return contrasive_loss
+
+    def bpr_forward(self, users, pos_items, neg_items):
+        # 普通の埋め込み
+        rep = self.get_def_rep()
+        users_r = rep[users, :]
+        pos_items_r, neg_items_r = rep[self.n_users + pos_items, :], rep[self.n_users + neg_items, :]
+        # AUG後の埋め込み
+        
+        aug_rep = self.get_aug_rep(self.norm_aug_adj)
+        aug_users_r = aug_rep[users, :]
+        l2_norm_sq = torch.norm(users_r, p=2, dim=1) ** 2 + torch.norm(pos_items_r, p=2, dim=1) ** 2 \
+                     + torch.norm(neg_items_r, p=2, dim=1) ** 2
+        # Contrasive loss
+        contrasive_loss = self.cal_loss(users_r, aug_users_r)
+        return users_r, pos_items_r, neg_items_r, l2_norm_sq, contrasive_loss
+
+
+
+    def predict(self, users):
+        rep = self.get_def_rep()
+        users_r = rep[users, :]
+        all_items_r = rep[self.n_users:, :]
+        scores = torch.mm(users_r, all_items_r.t())
+        return scores
+    
+    def save(self, path):
+        params = {'sate_dict': self.state_dict(), 'user_map': self.user_map,
+                  'item_map': self.item_map, 'alpha': self.alpha}
+        torch.save(params, path)
+
+    def load(self, path):
+        params = torch.load(path, map_location=self.device)
+        self.load_state_dict(params['sate_dict'])
+        self.user_map = params['user_map']
+        self.item_map = params['item_map']
+        self.alpha = params['alpha']
+        self.feat_mat, _, _, self.row_sum = self.generate_feat(self.config['dataset'], is_updating=True)
+        self.update_feat_mat()
+
+
+class DOSE_aug4(BasicModel):
+    def __init__(self, model_config):
+        super(DOSE_aug4, self).__init__(model_config)
+        self.embedding_size = model_config['embedding_size']
+        self.n_layers = model_config['n_layers']
+        self.dropout = model_config['dropout']
+        self.feature_ratio = model_config['feature_ratio']  # Template%
+        self.norm_adj = self.generate_graph(model_config['dataset'])
+
+        self.alpha = 1.
+        self.delta = model_config.get('delta', 0.99)
+        self.taugh = model_config.get('taugh', 0.2)
+        self.pai = model_config.get('pai', 0.1)
+        self.aug_num = model_config['aug_num']
+        # self.temper = model_config['temper']
+        self.feat_mat, self.user_map, self.item_map, self.row_sum = \
+            self.generate_feat(model_config['dataset'],
+                               ranking_metric=model_config.get('ranking_metric', 'sort'))
+        self.update_feat_mat()
+        # self.norm_aug_adj = enerate_aug_graph(model_config['dataset'] )
+        self.embedding = nn.Embedding(self.feat_mat.shape[1], self.embedding_size)
+
+        self.w = nn.Parameter(torch.ones([self.embedding_size], dtype=torch.float32, device=self.device))
+        normal_(self.embedding.weight, std=0.1)
+        self.to(device=self.device)
+        self.norm_aug_adj = self.generate_aug_graph(model_config['dataset'])
+        self.times = model_config.get('times', 0.1)
+        # self.aug_num = (self.times) * len(self.feat_mat)
+
+    def update_feat_mat(self):
+        row, _ = self.feat_mat.indices()
+        edge_values = torch.pow(self.row_sum[row], (self.alpha - 1.) / 2. - 0.5)
+        self.feat_mat = torch.sparse.FloatTensor(self.feat_mat.indices(), edge_values, self.feat_mat.shape).coalesce()
+
+    def feat_mat_anneal(self):
+        self.alpha *= self.delta
+        self.update_feat_mat()
+
+    def generate_graph(self, dataset):
+        return LightGCN.generate_graph(self, dataset)
+
+    def generate_aug_graph(self, dataset):
+        # new graph after adding some interactions
+        aug_idx = self.cal_cos_sim()
+        aug_adj_mat = generate_aug_daj_mat(dataset, aug_idx)
+        degree = np.array(np.sum(aug_adj_mat, axis=1)).squeeze()
+        degree = np.maximum(1., degree)
+        d_inv = np.power(degree, -0.5)  # 累乗
+        d_mat = sp.diags(d_inv, format='csr', dtype=np.float32)
+
+        norm_aug_adj = d_mat.dot(aug_adj_mat).dot(d_mat)
+        norm_aug_adj = get_sparse_tensor(norm_aug_adj, self.device)
+        return norm_aug_adj
+
+    def generate_feat(self, dataset, is_updating=False, ranking_metric=None):
+        # return adj matrix with template
+        if not is_updating:
+            if self.feature_ratio < 1.:  # ランク付後にスライス
+
+                ranked_users, ranked_items = graph_rank_nodes(dataset, ranking_metric)
+                core_users = ranked_users[:int(self.n_users * self.feature_ratio)]
+                core_items = ranked_items[:int(self.n_items * self.feature_ratio)]
+            else:
+                core_users = np.arange(self.n_users, dtype=np.int64)
+                core_items = np.arange(self.n_items, dtype=np.int64)
+
+            user_map = dict()
+            for idx, user in enumerate(core_users):
+                user_map[user] = idx
+            item_map = dict()
+            for idx, item in enumerate(core_items):
+                item_map[item] = idx
+        else:
+            user_map = self.user_map
+            item_map = self.item_map
+
+        user_dim, item_dim = len(user_map), len(item_map)
+        indices = []
+        for user, item in dataset.train_array:
+            if item in item_map:
+                indices.append([user, user_dim + item_map[item]])
+            if user in user_map:
+                indices.append([self.n_users + item, user_map[user]])
+        for user in range(self.n_users):
+            indices.append([user, user_dim + item_dim])
+        for item in range(self.n_items):
+            indices.append([self.n_users + item, user_dim + item_dim + 1])
+        feat = sp.coo_matrix((np.ones((len(indices),)), np.array(indices).T),
+                             shape=(self.n_users + self.n_items, user_dim + item_dim + 2), dtype=np.float32).tocsr()
+        row_sum = torch.tensor(np.array(np.sum(feat, axis=1)).squeeze(), dtype=torch.float32, device=self.device)
+        feat = get_sparse_tensor(feat, self.device)
+        return feat, user_map, item_map, row_sum
+
+    def inductive_rep_layer(self, feat_mat):
+        padding_tensor = torch.empty([max(self.feat_mat.shape) - self.feat_mat.shape[1], self.embedding_size],
+                                     dtype=torch.float32, device=self.device)
+        padding_features = torch.cat([self.embedding.weight, padding_tensor], dim=0)
+
+        row, column = feat_mat.indices()
+        g = dgl.graph((column, row), num_nodes=max(self.feat_mat.shape), device=self.device)
+        x = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=padding_features, rhs_data=feat_mat.values())
+        x = x[:self.feat_mat.shape[0], :]
+        return x
+
+    def get_def_rep(self):
+        # generate final embedding
+        feat_mat = NGCF.dropout_sp_mat(self, self.feat_mat)
+        representations = self.inductive_rep_layer(feat_mat)
+
+        all_layer_rep = [representations]
+        row, column = self.norm_adj.indices()
+        g = dgl.graph((column, row), num_nodes=self.norm_adj.shape[0], device=self.device)
+        for _ in range(self.n_layers):
+            representations = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=representations, rhs_data=self.norm_adj.values())
+            all_layer_rep.append(representations)
+        all_layer_rep = torch.stack(all_layer_rep, dim=0)
+        final_rep = all_layer_rep.mean(dim=0)
+        return final_rep
+
+    def get_aug_rep(self, norm_aug_adj):
+        # generate final embedding on aug-graph
+        feat_mat = NGCF.dropout_sp_mat(self, self.feat_mat)
+        representations = self.inductive_rep_layer(feat_mat)
+
+        all_layer_rep = [representations]
+        row, column = norm_aug_adj.indices()
+        g = dgl.graph((column, row), num_nodes=norm_aug_adj.shape[0], device=self.device)
+        for _ in range(self.n_layers):
+            representations = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=representations, rhs_data=norm_aug_adj.values())
+            all_layer_rep.append(representations)
+        all_layer_rep = torch.stack(all_layer_rep, dim=0)
+        final_rep = all_layer_rep.mean(dim=0)
+        return final_rep
+
+    def cal_cos_sim(self):
+        # calculate cosine similarity with user embeddings and item embeddings (on CPU)
+        rep = self.get_def_rep()
+        all_users_r = rep[:self.n_users, :]
+        all_items_r = rep[self.n_users:, :]
+
+        cos_mat = pairwise_cosine_similarity(all_users_r, all_items_r)
+
+        del all_users_r, all_items_r
+        torch.cuda.empty_cache()
+
+        u_id, i_id = torch.where(cos_mat >= self.pai)
+
+        del cos_mat
+        torch.cuda.empty_cache()
+
+        idx = torch.stack([u_id, i_id], dim=1)
+        idx = idx.tolist()
+
+        return idx  # return list [user_id, item_id]
+
+    def cal_cos_sim_v2(self):
+        # calculate cosine similarity with user embeddings and item embeddings (on GPU)
+        rep = self.get_def_rep()
+        all_users_r = rep[:self.n_users, :]
+        all_items_r = rep[self.n_users:, :]
+
+        cos_sim = pairwise_cosine_similarity(all_users_r, all_items_r)
+        cos_sim = torch.reshape(cos_sim, (1, -1))
+        _, idx = torch.topk(cos_sim, self.aug_num)
+        aug_idx = [[int(torch.div(idx[0][i], self.n_items, rounding_mode='floor')),
+                    (int(torch.fmod(idx[0][i], self.n_items)))] for i in range(self.aug_num)]
+
+        return aug_idx  # return list [user_id, item_id]
+
+    def cal_loss(self, users_r, aug_users_r):
+        # calcrate ssl-loss(InfoNCE)
+        loss = InfoNCE(negative_mode='unpaired')
+
+        query = users_r
+        positive_key = aug_users_r
+        negative_keys = aug_users_r
+        contrasive_loss = loss(query, positive_key, negative_keys)
+        return contrasive_loss
+
+    def bpr_forward(self, users, pos_items, neg_items):
+        # 普通の埋め込み
+        rep = self.get_def_rep()
+        users_r = rep[users, :]
+        pos_items_r, neg_items_r = rep[self.n_users + pos_items, :], rep[self.n_users + neg_items, :]
+        # AUG後の埋め込み
+
+        aug_rep = self.get_aug_rep(self.norm_aug_adj)
+        aug_users_r = aug_rep[users, :]
+        l2_norm_sq = torch.norm(users_r, p=2, dim=1) ** 2 + torch.norm(pos_items_r, p=2, dim=1) ** 2 \
+                     + torch.norm(neg_items_r, p=2, dim=1) ** 2
+        # Contrasive loss
+        contrasive_loss = self.cal_loss(users_r, aug_users_r)
+        return users_r, pos_items_r, neg_items_r, l2_norm_sq, contrasive_loss
+
+    def predict(self, users):
+        rep = self.get_def_rep()
+        users_r = rep[users, :]
+        all_items_r = rep[self.n_users:, :]
+        scores = torch.mm(users_r, all_items_r.t())
+        return scores
+
+    def save(self, path):
+        params = {'sate_dict': self.state_dict(), 'user_map': self.user_map,
+                  'item_map': self.item_map, 'alpha': self.alpha}
+        torch.save(params, path)
+
+    def load(self, path):
+        params = torch.load(path, map_location=self.device)
+        self.load_state_dict(params['sate_dict'])
+        self.user_map = params['user_map']
+        self.item_map = params['item_map']
+        self.alpha = params['alpha']
+        self.feat_mat, _, _, self.row_sum = self.generate_feat(self.config['dataset'], is_updating=True)
+        self.update_feat_mat()
+
+class DOSE_aug2(BasicModel):
+    def __init__(self, model_config):
+        super(DOSE_aug2, self).__init__(model_config)
+        self.embedding_size = model_config['embedding_size']
+        self.n_layers = model_config['n_layers']
+        self.dropout = model_config['dropout']
+        self.feature_ratio = model_config['feature_ratio']  # Template%
+        self.norm_adj = self.generate_graph(model_config['dataset'])
+
+        self.alpha = 1.
+        self.delta = model_config.get('delta', 0.99)
+        self.taugh = model_config.get('taugh', 0.2)
+        self.aug_num = model_config['aug_num']
+        self.aug_num = int(self.aug_num)
+        # self.temper = model_config['temper']
+        self.feat_mat, self.user_map, self.item_map, self.row_sum = \
+            self.generate_feat(model_config['dataset'],
+                               ranking_metric=model_config.get('ranking_metric', 'sort'))
+        self.update_feat_mat()
+        # self.norm_aug_adj = generate_aug_graph(model_config['dataset'] )
+        self.embedding = nn.Embedding(self.feat_mat.shape[1], self.embedding_size)
+
+        self.w = nn.Parameter(torch.ones([self.embedding_size], dtype=torch.float32, device=self.device))
+        normal_(self.embedding.weight, std=0.1)
+        self.to(device=self.device)
+        self.norm_aug_adj = self.generate_aug_graph(model_config['dataset'])
+        self.times = model_config.get('times', 0.1)
+        self.aug_feat_mat, self.aug_user_map, self.aug_item_map, self.aug_row_sum = \
+            self.generate_aug_feat(model_config['dataset'],
+                               ranking_metric=model_config.get('ranking_metric', 'sort'))
+        # self.aug_num = (self.times) * len(self.feat_mat)
+
+    def update_feat_mat(self):
+        row, _ = self.feat_mat.indices()
+        edge_values = torch.pow(self.row_sum[row], (self.alpha - 1.) / 2. - 0.5)
+        self.feat_mat = torch.sparse.FloatTensor(self.feat_mat.indices(), edge_values, self.feat_mat.shape).coalesce()
+
+    def update_aug_feat_mat(self):
+        row, _ = self.aug_feat_mat.indices()
+        edge_values = torch.pow(self.row_sum[row], (self.alpha - 1.) / 2. - 0.5)
+        self.aug_feat_mat = torch.sparse.FloatTensor(self.aug_feat_mat.indices(), edge_values,
+                                                     self.aug_feat_mat.shape).coalesce()
+
+    def feat_mat_anneal(self):
+        self.alpha *= self.delta
+        self.update_feat_mat()
+
+    def generate_graph(self, dataset):
+        return LightGCN.generate_graph(self, dataset)
+
+    def generate_aug_graph(self, dataset):
+        # new graph after adding some interactions
+        aug_idx = self.cal_cos_sim()
+        aug_adj_mat = generate_aug_daj_mat(dataset, aug_idx)
+        degree = np.array(np.sum(aug_adj_mat, axis=1)).squeeze()
+        degree = np.maximum(1., degree)
+        d_inv = np.power(degree, -0.5) # 累乗
+        d_mat = sp.diags(d_inv, format='csr', dtype=np.float32)
+
+        norm_aug_adj = d_mat.dot(aug_adj_mat).dot(d_mat)
+        norm_aug_adj = get_sparse_tensor(norm_aug_adj, self.device)
+        return norm_aug_adj
+
+    def generate_feat(self, dataset, is_updating=False, ranking_metric=None):
+        # return adj matrix with template
+        if not is_updating:
+            if self.feature_ratio < 1.:  # ランク付後にスライス
+
+                ranked_users, ranked_items = graph_rank_nodes(dataset, ranking_metric)
+                core_users = ranked_users[:int(self.n_users * self.feature_ratio)]
+                core_items = ranked_items[:int(self.n_items * self.feature_ratio)]
+            else:
+                core_users = np.arange(self.n_users, dtype=np.int64)
+                core_items = np.arange(self.n_items, dtype=np.int64)
+
+            user_map = dict()
+            for idx, user in enumerate(core_users):
+                user_map[user] = idx
+            item_map = dict()
+            for idx, item in enumerate(core_items):
+                item_map[item] = idx
+        else:
+            user_map = self.user_map
+            item_map = self.item_map
+
+        user_dim, item_dim = len(user_map), len(item_map)
+        indices = []
+
+        for user, item in dataset.train_array:
+            if item in item_map:
+                indices.append([user, user_dim + item_map[item]])
+            if user in user_map:
+                indices.append([self.n_users + item, user_map[user]])
+        for user in range(self.n_users):
+            indices.append([user, user_dim + item_dim])
+        for item in range(self.n_items):
+            indices.append([self.n_users + item, user_dim + item_dim + 1])
+        feat = sp.coo_matrix((np.ones((len(indices),)), np.array(indices).T),
+                             shape=(self.n_users + self.n_items, user_dim + item_dim + 2), dtype=np.float32).tocsr()
+        row_sum = torch.tensor(np.array(np.sum(feat, axis=1)).squeeze(), dtype=torch.float32, device=self.device)
+        feat = get_sparse_tensor(feat, self.device)
+        return feat, user_map, item_map, row_sum
+
+    def generate_aug_feat(self, dataset, is_updating=False, ranking_metric=None):
+        # return adj matrix with template
+        aug_idx = self.cal_cos_sim()
+        if not is_updating:
+            if self.feature_ratio < 1.:  # ランク付後にスライス
+
+                ranked_users, ranked_items = graph_aug_rank_nodes(dataset, ranking_metric, aug_idx)
+                core_users = ranked_users[:int(self.n_users * self.feature_ratio)]
+                core_items = ranked_items[:int(self.n_items * self.feature_ratio)]
+            else:
+                core_users = np.arange(self.n_users, dtype=np.int64)
+                core_items = np.arange(self.n_items, dtype=np.int64)
+
+            user_map = dict()
+            for idx, user in enumerate(core_users):
+                user_map[user] = idx
+            item_map = dict()
+            for idx, item in enumerate(core_items):
+                item_map[item] = idx
+        else:
+            user_map = self.user_map
+            item_map = self.item_map
+
+        user_dim, item_dim = len(user_map), len(item_map)
+
+        train_array = dataset.train_array
+        train_array.extend(aug_idx)
+        train_array = list(map(list, set(map(tuple, train_array))))
+
+        indices = []
+        for user, item in train_array:
+            if item in item_map:
+                indices.append([user, user_dim + item_map[item]])
+            if user in user_map:
+                indices.append([self.n_users + item, user_map[user]])
+        for user in range(self.n_users):
+            indices.append([user, user_dim + item_dim])
+        for item in range(self.n_items):
+            indices.append([self.n_users + item, user_dim + item_dim + 1])
+        feat = sp.coo_matrix((np.ones((len(indices),)), np.array(indices).T),
+                             shape=(self.n_users + self.n_items, user_dim + item_dim + 2), dtype=np.float32).tocsr()
+        row_sum = torch.tensor(np.array(np.sum(feat, axis=1)).squeeze(), dtype=torch.float32, device=self.device)
+        feat = get_sparse_tensor(feat, self.device)
+        return feat, user_map, item_map, row_sum
+
+    def inductive_rep_layer(self, feat_mat):
+        # generate embedding by using template
+        padding_tensor = torch.empty([max(self.feat_mat.shape) - self.feat_mat.shape[1], self.embedding_size],
+                                     dtype=torch.float32, device=self.device)
+        padding_features = torch.cat([self.embedding.weight, padding_tensor], dim=0)
+
+        row, column = feat_mat.indices()
+        g = dgl.graph((column, row), num_nodes=max(self.feat_mat.shape), device=self.device)
+        x = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=padding_features, rhs_data=feat_mat.values())
+        x = x[:self.feat_mat.shape[0], :]
+        return x
+
+    def inductive_aug_rep_layer(self, aug_feat_mat):
+        # generate embedding by using template
+        padding_tensor = torch.empty([max(self.aug_feat_mat.shape) - self.aug_feat_mat.shape[1], self.embedding_size],
+                                     dtype=torch.float32, device=self.device)
+        padding_features = torch.cat([self.embedding.weight, padding_tensor], dim=0)
+
+        row, column = aug_feat_mat.indices()
+        g = dgl.graph((column, row), num_nodes=max(self.aug_feat_mat.shape), device=self.device)
+        x = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=padding_features, rhs_data=aug_feat_mat.values())
+        x = x[:self.aug_feat_mat.shape[0], :]
+        return x
+
+    def get_def_rep(self):
+        # generate final embedding
+        feat_mat = NGCF.dropout_sp_mat(self, self.feat_mat)
+        representations = self.inductive_rep_layer(feat_mat)
+
+        all_layer_rep = [representations]
+        row, column = self.norm_adj.indices()
+        g = dgl.graph((column, row), num_nodes=self.norm_adj.shape[0], device=self.device)
+        for _ in range(self.n_layers):
+            representations = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=representations, rhs_data=self.norm_adj.values())
+            all_layer_rep.append(representations)
+        all_layer_rep = torch.stack(all_layer_rep, dim=0)
+        final_rep = all_layer_rep.mean(dim=0)
+        return final_rep
+
+    def get_aug_rep(self, norm_aug_adj):
+        # generate final embedding on aug-graph
+        feat_mat = NGCF.dropout_sp_mat(self, self.feat_mat)
+        representations = self.inductive_rep_layer(feat_mat)
+
+        all_layer_rep = [representations]
+        row, column = norm_aug_adj.indices()
+        g = dgl.graph((column, row), num_nodes=norm_aug_adj.shape[0], device=self.device)
+        for _ in range(self.n_layers):
+            representations = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=representations, rhs_data=norm_aug_adj.values())
+            all_layer_rep.append(representations)
+        all_layer_rep = torch.stack(all_layer_rep, dim=0)
+        final_rep = all_layer_rep.mean(dim=0)
+        return final_rep
+
+    def cal_cos_sim(self):
+        # calculate cosine similarity with user embeddings and item embeddings (on CPU)
+        rep = self.get_def_rep()
+        all_users_r = rep[:self.n_users, :]
+        all_items_r = rep[self.n_users:, :]
+
+        all_users_r = all_users_r.to('cpu').detach().numpy().copy()
+        all_items_r = all_items_r.to('cpu').detach().numpy().copy()
+
+        x = cosine_similarity(all_users_r, all_items_r)
+        cos_mat = torch.from_numpy(x.astype(np.float32)).clone()
+        cos_mat.to(device=self.device)
+        cos_mat = torch.reshape(cos_mat, (1, -1))
+        _, idx = torch.topk(cos_mat, self.aug_num)
+        #idx = idx.tolist()S
+        aug_idx = [[int(torch.div(idx[0][i], self.n_items, rounding_mode='floor')), (int(torch.fmod(idx[0][i], self.n_items)))] for i in range(self.aug_num)]
+
+        return aug_idx  # return list [user_id, item_id]
+
+    def cal_cos_sim_v2(self):
+        # calculate cosine similarity with user embeddings and item embeddings (on GPU)
+        rep = self.get_def_rep()
+        all_users_r = rep[:self.n_users, :]
+        all_items_r = rep[self.n_users:, :]
+
+        cos_sim = pairwise_cosine_similarity(all_users_r, all_items_r)
+        cos_sim = torch.reshape(cos_sim, (1, -1))
+        _, idx = torch.topk(cos_sim, self.aug_num)
+        aug_idx = [[int(torch.div(idx[0][i], self.n_items, rounding_mode='floor')), (int(torch.fmod(idx[0][i], self.n_items)))] for i in range(self.aug_num)]
+
+        return aug_idx  # return list [user_id, item_id]
+
+    def cal_loss(self, users_r, aug_users_r):
+        # calcrate ssl-loss(InfoNCE)
+        loss = InfoNCE(negative_mode='unpaired')
+
+        query = users_r
+        positive_key = aug_users_r
+        negative_keys = aug_users_r
+        contrasive_loss = loss(query, positive_key, negative_keys)
+        return contrasive_loss
+
+    def bpr_forward(self, users, pos_items, neg_items):
+        # 普通の埋め込み
+        rep = self.get_def_rep()
+        users_r = rep[users, :]
+        pos_items_r, neg_items_r = rep[self.n_users + pos_items, :], rep[self.n_users + neg_items, :]
+        # AUG後の埋め込み
+
+        aug_rep = self.get_aug_rep(self.norm_aug_adj)
+        aug_users_r = aug_rep[users, :]
+        l2_norm_sq = torch.norm(users_r, p=2, dim=1) ** 2 + torch.norm(pos_items_r, p=2, dim=1) ** 2 \
+                     + torch.norm(neg_items_r, p=2, dim=1) ** 2
+        # Contrasive loss
+        contrasive_loss = self.cal_loss(users_r, aug_users_r)
+        return users_r, pos_items_r, neg_items_r, l2_norm_sq, contrasive_loss
+
+
+
+    def predict(self, users):
+        rep = self.get_def_rep()
+        users_r = rep[users, :]
+        all_items_r = rep[self.n_users:, :]
+        scores = torch.mm(users_r, all_items_r.t())
+        return scores
+
+    def save(self, path):
+        params = {'sate_dict': self.state_dict(), 'user_map': self.user_map,
+                  'item_map': self.item_map, 'alpha': self.alpha}
+        torch.save(params, path)
+
+    def load(self, path):
+        params = torch.load(path, map_location=self.device)
+        self.load_state_dict(params['sate_dict'])
+        self.user_map = params['user_map']
+        self.item_map = params['item_map']
+        self.alpha = params['alpha']
+        self.feat_mat, _, _, self.row_sum = self.generate_feat(self.config['dataset'], is_updating=True)
+        self.update_feat_mat()
+
+
+class DOSE_aug3(BasicModel):
+    def __init__(self, model_config):
+        super(DOSE_aug3, self).__init__(model_config)
+        self.embedding_size = model_config['embedding_size']
+        self.n_layers = model_config['n_layers']
+        self.dropout = model_config['dropout']
+        self.feature_ratio = model_config['feature_ratio']  # Template%
+        self.norm_adj = self.generate_graph(model_config['dataset'])
+
+        self.alpha = 1.
+        self.delta = model_config.get('delta', 0.99)
+        self.taugh = model_config.get('taugh', 0.2)
+        self.aug_num = model_config['aug_num']
+        self.aug_num = int(self.aug_num)
+        # self.temper = model_config['temper']
+        self.feat_mat, self.user_map, self.item_map, self.row_sum = \
+            self.generate_feat(model_config['dataset'],
+                               ranking_metric=model_config.get('ranking_metric', 'sort'))
+        self.update_feat_mat()
+        # self.norm_aug_adj = enerate_aug_graph(model_config['dataset'] )
+        self.embedding = nn.Embedding(self.feat_mat.shape[1], self.embedding_size)
+
+        self.w = nn.Parameter(torch.ones([self.embedding_size], dtype=torch.float32, device=self.device))
+        normal_(self.embedding.weight, std=0.1)
+        self.to(device=self.device)
+        self.norm_aug_adj = self.generate_aug_graph(model_config['dataset'])
+        self.times = model_config.get('times', 0.1)
+        # self.aug_num = (self.times) * len(self.feat_mat)
+
+    def update_feat_mat(self):
+        row, _ = self.feat_mat.indices()
+        edge_values = torch.pow(self.row_sum[row], (self.alpha - 1.) / 2. - 0.5)
+        self.feat_mat = torch.sparse.FloatTensor(self.feat_mat.indices(), edge_values, self.feat_mat.shape).coalesce()
+
+    def feat_mat_anneal(self):
+        self.alpha *= self.delta
+        self.update_feat_mat()
+
+    def generate_graph(self, dataset):
+        return LightGCN.generate_graph(self, dataset)
+
+    def generate_aug_graph(self, dataset):
+        # new graph after adding some interactions
+        user_id = np.random.randint(0, self.n_users, self.aug_num)
+        item_id = np.random.randint(0, self.n_items, self.aug_num)
+        aug_idx = np.stack([user_id, item_id], 1)
+        aug_idx = aug_idx.tolist()
+        aug_adj_mat = generate_aug_daj_mat(dataset, aug_idx)
+        degree = np.array(np.sum(aug_adj_mat, axis=1)).squeeze()
+        degree = np.maximum(1., degree)
+        d_inv = np.power(degree, -0.5)  # 累乗
+        d_mat = sp.diags(d_inv, format='csr', dtype=np.float32)
+
+        norm_aug_adj = d_mat.dot(aug_adj_mat).dot(d_mat)
+        norm_aug_adj = get_sparse_tensor(norm_aug_adj, self.device)
+        return norm_aug_adj
+
+    def generate_feat(self, dataset, is_updating=False, ranking_metric=None):
+        # return adj matrix with template
+        if not is_updating:
+            if self.feature_ratio < 1.:  # ランク付後にスライス
+
+                ranked_users, ranked_items = graph_rank_nodes(dataset, ranking_metric)
+                core_users = ranked_users[:int(self.n_users * self.feature_ratio)]
+                core_items = ranked_items[:int(self.n_items * self.feature_ratio)]
+            else:
+                core_users = np.arange(self.n_users, dtype=np.int64)
+                core_items = np.arange(self.n_items, dtype=np.int64)
+
+            user_map = dict()
+            for idx, user in enumerate(core_users):
+                user_map[user] = idx
+            item_map = dict()
+            for idx, item in enumerate(core_items):
+                item_map[item] = idx
+        else:
+            user_map = self.user_map
+            item_map = self.item_map
+
+        user_dim, item_dim = len(user_map), len(item_map)
+        indices = []
+        for user, item in dataset.train_array:
+            if item in item_map:
+                indices.append([user, user_dim + item_map[item]])
+            if user in user_map:
+                indices.append([self.n_users + item, user_map[user]])
+        for user in range(self.n_users):
+            indices.append([user, user_dim + item_dim])
+        for item in range(self.n_items):
+            indices.append([self.n_users + item, user_dim + item_dim + 1])
+        feat = sp.coo_matrix((np.ones((len(indices),)), np.array(indices).T),
+                             shape=(self.n_users + self.n_items, user_dim + item_dim + 2), dtype=np.float32).tocsr()
+        row_sum = torch.tensor(np.array(np.sum(feat, axis=1)).squeeze(), dtype=torch.float32, device=self.device)
+        feat = get_sparse_tensor(feat, self.device)
+        return feat, user_map, item_map, row_sum
+
+    def inductive_rep_layer(self, feat_mat):
+        padding_tensor = torch.empty([max(self.feat_mat.shape) - self.feat_mat.shape[1], self.embedding_size],
+                                     dtype=torch.float32, device=self.device)
+        padding_features = torch.cat([self.embedding.weight, padding_tensor], dim=0)
+
+        row, column = feat_mat.indices()
+        g = dgl.graph((column, row), num_nodes=max(self.feat_mat.shape), device=self.device)
+        x = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=padding_features, rhs_data=feat_mat.values())
+        x = x[:self.feat_mat.shape[0], :]
+        return x
+
+    def get_def_rep(self):
+        # generate final embedding
+        feat_mat = NGCF.dropout_sp_mat(self, self.feat_mat)
+        representations = self.inductive_rep_layer(feat_mat)
+
+        all_layer_rep = [representations]
+        row, column = self.norm_adj.indices()
+        g = dgl.graph((column, row), num_nodes=self.norm_adj.shape[0], device=self.device)
+        for _ in range(self.n_layers):
+            representations = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=representations, rhs_data=self.norm_adj.values())
+            all_layer_rep.append(representations)
+        all_layer_rep = torch.stack(all_layer_rep, dim=0)
+        final_rep = all_layer_rep.mean(dim=0)
+        return final_rep
+
+    def get_aug_rep(self, norm_aug_adj):
+        # generate final embedding on aug-graph
+        feat_mat = NGCF.dropout_sp_mat(self, self.feat_mat)
+        representations = self.inductive_rep_layer(feat_mat)
+
+        all_layer_rep = [representations]
+        row, column = norm_aug_adj.indices()
+        g = dgl.graph((column, row), num_nodes=norm_aug_adj.shape[0], device=self.device)
+        for _ in range(self.n_layers):
+            representations = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=representations, rhs_data=norm_aug_adj.values())
+            all_layer_rep.append(representations)
+        all_layer_rep = torch.stack(all_layer_rep, dim=0)
+        final_rep = all_layer_rep.mean(dim=0)
+        return final_rep
+
+    def cal_cos_sim(self):
+        # calculate cosine similarity with user embeddings and item embeddings (on CPU)
+        rep = self.get_def_rep()
+        all_users_r = rep[:self.n_users, :]
+        all_items_r = rep[self.n_users:, :]
+
+        all_users_r = all_users_r.to('cpu').detach().numpy().copy()
+        all_items_r = all_items_r.to('cpu').detach().numpy().copy()
+
+        x = cosine_similarity(all_users_r, all_items_r)
+
+        cos_mat = torch.from_numpy(x.astype(np.float32)).clone()
+        cos_mat.to(device=self.device)
+        cos_mat = torch.reshape(cos_mat, (1, -1))
+        _, idx = torch.topk(cos_mat, self.aug_num)
+
+        del cos_mat
+        torch.cuda.empty_cache()
+        # gc.collect()
+        # idx = idx.tolist()S
+        aug_idx = [
+            [int(torch.div(idx[0][i], self.n_items, rounding_mode='floor')), (int(torch.fmod(idx[0][i], self.n_items)))]
+            for i in range(self.aug_num)]
+
+        return aug_idx  # return list [user_id, item_id]
+
+    def cal_cos_sim_v2(self):
+        # calculate cosine similarity with user embeddings and item embeddings (on GPU)
+        rep = self.get_def_rep()
+        all_users_r = rep[:self.n_users, :]
+        all_items_r = rep[self.n_users:, :]
+
+        cos_sim = pairwise_cosine_similarity(all_users_r, all_items_r)
+        cos_sim = torch.reshape(cos_sim, (1, -1))
+        _, idx = torch.topk(cos_sim, self.aug_num)
+        aug_idx = [
+            [int(torch.div(idx[0][i], self.n_items, rounding_mode='floor')), (int(torch.fmod(idx[0][i], self.n_items)))]
+            for i in range(self.aug_num)]
+
+        return aug_idx  # return list [user_id, item_id]
+
+    def cal_loss(self, users_r, aug_users_r):
+        # calcrate ssl-loss(InfoNCE)
+        loss = InfoNCE(negative_mode='unpaired')
+
+        query = users_r
+        positive_key = aug_users_r
+        negative_keys = aug_users_r
+        contrasive_loss = loss(query, positive_key, negative_keys)
+        return contrasive_loss
+
+    def bpr_forward(self, users, pos_items, neg_items):
+        # 普通の埋め込み
+        rep = self.get_def_rep()
+        users_r = rep[users, :]
+        pos_items_r, neg_items_r = rep[self.n_users + pos_items, :], rep[self.n_users + neg_items, :]
+        # AUG後の埋め込み
+
+        aug_rep = self.get_aug_rep(self.norm_aug_adj)
+        aug_users_r = aug_rep[users, :]
+        l2_norm_sq = torch.norm(users_r, p=2, dim=1) ** 2 + torch.norm(pos_items_r, p=2, dim=1) ** 2 \
+                     + torch.norm(neg_items_r, p=2, dim=1) ** 2
+        # Contrasive loss
+        contrasive_loss = self.cal_loss(users_r, aug_users_r)
+        return users_r, pos_items_r, neg_items_r, l2_norm_sq, contrasive_loss
+
+    def predict(self, users):
+        rep = self.get_def_rep()
+        users_r = rep[users, :]
+        all_items_r = rep[self.n_users:, :]
+        scores = torch.mm(users_r, all_items_r.t())
+        return scores
+
+    def save(self, path):
+        params = {'sate_dict': self.state_dict(), 'user_map': self.user_map,
+                  'item_map': self.item_map, 'alpha': self.alpha}
+        torch.save(params, path)
+
+    def load(self, path):
+        params = torch.load(path, map_location=self.device)
+        self.load_state_dict(params['sate_dict'])
+        self.user_map = params['user_map']
+        self.item_map = params['item_map']
+        self.alpha = params['alpha']
+        self.feat_mat, _, _, self.row_sum = self.generate_feat(self.config['dataset'], is_updating=True)
+        self.update_feat_mat()
+
+
+class DOSE_drop(BasicModel):
+    def __init__(self, model_config):
+        super(DOSE_drop, self).__init__(model_config)
+        self.embedding_size = model_config['embedding_size']
+        self.n_layers = model_config['n_layers']
+        self.dropout = model_config['dropout']
+        self.feature_ratio = model_config['feature_ratio']  # Template%
+        self.norm_adj = self.generate_graph(model_config['dataset'])
+
+        self.alpha = 1.
+        self.delta = model_config.get('delta', 0.99)
+        self.taugh = model_config.get('taugh', 0.2)
+        self.aug_num = model_config['aug_num']
+        self.aug_num = int(self.aug_num)
+        # self.temper = model_config['temper']
+        self.feat_mat, self.user_map, self.item_map, self.row_sum = \
+            self.generate_feat(model_config['dataset'],
+                               ranking_metric=model_config.get('ranking_metric', 'sort'))
+        self.update_feat_mat()
+        # self.norm_aug_adj = generate_aug_graph(model_config['dataset'] )
+        self.embedding = nn.Embedding(self.feat_mat.shape[1], self.embedding_size)
+
+        self.w = nn.Parameter(torch.ones([self.embedding_size], dtype=torch.float32, device=self.device))
+        normal_(self.embedding.weight, std=0.1)
+        self.to(device=self.device)
+        self.norm_aug_adj = self.generate_drop_graph(model_config['dataset'])
+        self.times = model_config.get('times', 0.1)
+        # self.drop_feat_mat, self.drop_user_map, self.drop_item_map, self.drop_row_sum = \
+            # self.generate_drop_feat(model_config['dataset'],
+                               # ranking_metric=model_config.get('ranking_metric', 'sort'))
+        # self.aug_num = (self.times) * len(self.feat_mat)
+
+    def update_feat_mat(self):
+        row, _ = self.feat_mat.indices()
+        edge_values = torch.pow(self.row_sum[row], (self.alpha - 1.) / 2. - 0.5)
+        self.feat_mat = torch.sparse.FloatTensor(self.feat_mat.indices(), edge_values, self.feat_mat.shape).coalesce()
+
+    def update_aug_feat_mat(self):
+        row, _ = self.drop_feat_mat.indices()
+        edge_values = torch.pow(self.row_sum[row], (self.alpha - 1.) / 2. - 0.5)
+        self.drop_feat_mat = torch.sparse.FloatTensor(self.drop_feat_mat.indices(), edge_values,
+                                                     self.drop_feat_mat.shape).coalesce()
+
+    def feat_mat_anneal(self):
+        self.alpha *= self.delta
+        self.update_feat_mat()
+    def update_aug_adj(self):
+        del self.norm_aug_adj
+        torch.cuda.empty_cache()
+        gc.collect()
+        self.norm_aug_adj = self.generate_drop_graph(self.config['dataset'])
+
+    def generate_graph(self, dataset):
+        return LightGCN.generate_graph(self, dataset)
+
+    def generate_drop_graph(self, dataset):
+        # new graph after adding some interactions
+        aug_idx = self.cal_cos_sim()
+        aug_adj_mat = generate_drop_daj_mat3(dataset, aug_idx)
+        degree = np.array(np.sum(aug_adj_mat, axis=1)).squeeze()
+        degree = np.maximum(1., degree)
+        d_inv = np.power(degree, -0.5)  # 累乗
+        d_mat = sp.diags(d_inv, format='csr', dtype=np.float32)
+
+        norm_aug_adj = d_mat.dot(aug_adj_mat).dot(d_mat)
+        norm_aug_adj = get_sparse_tensor(norm_aug_adj, self.device)
+        return norm_aug_adj
+
+    def generate_feat(self, dataset, is_updating=False, ranking_metric=None):
+        # return adj matrix with template
+        if not is_updating:
+            if self.feature_ratio < 1.:  # ランク付後にスライス
+
+                ranked_users, ranked_items = graph_rank_nodes(dataset, ranking_metric)
+                core_users = ranked_users[:int(self.n_users * self.feature_ratio)]
+                core_items = ranked_items[:int(self.n_items * self.feature_ratio)]
+            else:
+                core_users = np.arange(self.n_users, dtype=np.int64)
+                core_items = np.arange(self.n_items, dtype=np.int64)
+
+            user_map = dict()
+            for idx, user in enumerate(core_users):
+                user_map[user] = idx
+            item_map = dict()
+            for idx, item in enumerate(core_items):
+                item_map[item] = idx
+        else:
+            user_map = self.user_map
+            item_map = self.item_map
+
+        user_dim, item_dim = len(user_map), len(item_map)
+        indices = []
+        for user, item in dataset.train_array:
+            if item in item_map:
+                indices.append([user, user_dim + item_map[item]])
+            if user in user_map:
+                indices.append([self.n_users + item, user_map[user]])
+        for user in range(self.n_users):
+            indices.append([user, user_dim + item_dim])
+        for item in range(self.n_items):
+            indices.append([self.n_users + item, user_dim + item_dim + 1])
+        feat = sp.coo_matrix((np.ones((len(indices),)), np.array(indices).T),
+                             shape=(self.n_users + self.n_items, user_dim + item_dim + 2), dtype=np.float32).tocsr()
+        row_sum = torch.tensor(np.array(np.sum(feat, axis=1)).squeeze(), dtype=torch.float32, device=self.device)
+        feat = get_sparse_tensor(feat, self.device)
+        return feat, user_map, item_map, row_sum
+
+    def generate_drop_feat(self, dataset, is_updating=False, ranking_metric=None):
+        # return adj matrix with template
+        if not is_updating:
+            if self.feature_ratio < 1.:  # ランク付後にスライス
+
+                ranked_users, ranked_items = graph_drop_rank_nodes(dataset, ranking_metric)
+                core_users = ranked_users[:int(self.n_users * self.feature_ratio)]
+                core_items = ranked_items[:int(self.n_items * self.feature_ratio)]
+            else:
+                core_users = np.arange(self.n_users, dtype=np.int64)
+                core_items = np.arange(self.n_items, dtype=np.int64)
+
+            user_map = dict()
+            for idx, user in enumerate(core_users):
+                user_map[user] = idx
+            item_map = dict()
+            for idx, item in enumerate(core_items):
+                item_map[item] = idx
+        else:
+            user_map = self.user_map
+            item_map = self.item_map
+
+        user_dim, item_dim = len(user_map), len(item_map)
+
+        train_array = dataset.train_array
+        random.sample(train_array, int(len(train_array) * 0.5))
+        indices = []
+        for user, item in train_array:
+            if item in item_map:
+                indices.append([user, user_dim + item_map[item]])
+            if user in user_map:
+                indices.append([self.n_users + item, user_map[user]])
+        for user in range(self.n_users):
+            indices.append([user, user_dim + item_dim])
+        for item in range(self.n_items):
+            indices.append([self.n_users + item, user_dim + item_dim + 1])
+        feat = sp.coo_matrix((np.ones((len(indices),)), np.array(indices).T),
+                             shape=(self.n_users + self.n_items, user_dim + item_dim + 2), dtype=np.float32).tocsr()
+        row_sum = torch.tensor(np.array(np.sum(feat, axis=1)).squeeze(), dtype=torch.float32, device=self.device)
+        feat = get_sparse_tensor(feat, self.device)
+        return feat, user_map, item_map, row_sum
+
+    def inductive_rep_layer(self, feat_mat):
+        # generate embedding by using template
+        padding_tensor = torch.empty([max(self.feat_mat.shape) - self.feat_mat.shape[1], self.embedding_size],
+                                     dtype=torch.float32, device=self.device)
+        padding_features = torch.cat([self.embedding.weight, padding_tensor], dim=0)
+
+        row, column = feat_mat.indices()
+        g = dgl.graph((column, row), num_nodes=max(self.feat_mat.shape), device=self.device)
+        x = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=padding_features, rhs_data=feat_mat.values())
+        x = x[:self.feat_mat.shape[0], :]
+        return x
+
+    def inductive_drop_rep_layer(self, drop_feat_mat):
+        # generate embedding by using template
+        padding_tensor = torch.empty([max(self.drop_feat_mat.shape) - self.drop_feat_mat.shape[1], self.embedding_size],
+                                     dtype=torch.float32, device=self.device)
+        padding_features = torch.cat([self.embedding.weight, padding_tensor], dim=0)
+
+        row, column = drop_feat_mat.indices()
+        g = dgl.graph((column, row), num_nodes=max(self.drop_feat_mat.shape), device=self.device)
+        x = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=padding_features, rhs_data=drop_feat_mat.values())
+        x = x[:self.aug_feat_mat.shape[0], :]
+        return x
+
+    def get_def_rep(self):
+        # generate final embedding
+        feat_mat = NGCF.dropout_sp_mat(self, self.feat_mat)
+        representations = self.inductive_rep_layer(feat_mat)
+
+        all_layer_rep = [representations]
+        row, column = self.norm_adj.indices()
+        g = dgl.graph((column, row), num_nodes=self.norm_adj.shape[0], device=self.device)
+        for _ in range(self.n_layers):
+            representations = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=representations, rhs_data=self.norm_adj.values())
+            all_layer_rep.append(representations)
+        all_layer_rep = torch.stack(all_layer_rep, dim=0)
+        final_rep = all_layer_rep.mean(dim=0)
+        return final_rep
+
+    def get_aug_rep(self, norm_aug_adj):
+        # generate final embedding on aug-graph
+        feat_mat = NGCF.dropout_sp_mat(self, self.feat_mat)
+        representations = self.inductive_rep_layer(feat_mat)
+
+        all_layer_rep = [representations]
+        row, column = norm_aug_adj.indices()
+        g = dgl.graph((column, row), num_nodes=norm_aug_adj.shape[0], device=self.device)
+        for _ in range(self.n_layers):
+            representations = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=representations, rhs_data=norm_aug_adj.values())
+            all_layer_rep.append(representations)
+        all_layer_rep = torch.stack(all_layer_rep, dim=0)
+        final_rep = all_layer_rep.mean(dim=0)
+        return final_rep
+
+    def cal_cos_sim(self):
+        # calculate cosine similarity with user embeddings and item embeddings (on CPU)
+
+        rep = self.get_def_rep()
+        all_users_r = rep[:self.n_users, :]
+        all_items_r = rep[self.n_users:, :]
+
+
+        all_user_r = all_users_r.to('cpu').detach().numpy().copy()
+        all_item_r = all_items_r.to('cpu').detach().numpy().copy()
+
+        x = cosine_similarity(all_user_r, all_item_r)
+
+        del all_users_r, all_items_r
+        del all_user_r, all_item_r
+        torch.cuda.empty_cache()
+
+        cos_mat = torch.from_numpy(x.astype(np.float32)).clone()
+        cos_mat.to(device=self.device)
+        cos_mat = torch.reshape(cos_mat, (1, -1))
+        cos_mat = torch.squeeze(cos_mat)
+        cos_mat1 = cos_mat[:len(cos_mat) // 2]
+        _, idx1 = torch.topk(cos_mat1, self.aug_num // 2)
+        cos_mat2 = cos_mat[len(cos_mat) // 2:]
+
+        del cos_mat
+        torch.cuda.empty_cache()
+        # gc.collect()
+        print(len(cos_mat2))
+        _, idx2 = torch.topk(cos_mat2, self.aug_num // 2)
+        # idx = idx.tolist()S
+        aug_idx1 = [[int(torch.div(idx1[i], self.n_items, rounding_mode='floor')),
+                     (int(torch.fmod(idx1[i], self.n_items)))] for i in range(self.aug_num // 2)]
+        # aug_idx.to(device=self.device)
+        aug_idx2 = [
+            [int(torch.div(idx2[i] + self.aug_num // 2, self.n_items, rounding_mode='floor')),
+             (int(torch.fmod(idx2[i] + self.aug_num // 2, self.n_items)))] for i
+            in range(self.aug_num // 2)]
+        aug_idx1.extend(aug_idx2)
+        del aug_idx2, idx1, idx2
+        torch.cuda.empty_cache()
+
+        return aug_idx1  # return list [user_id, item_id]
+
+    def cal_cos_sim_v2(self):
+        # calculate cosine similarity with user embeddings and item embeddings (on GPU)
+        rep = self.get_def_rep()
+        all_users_r = rep[:self.n_users, :]
+        all_items_r = rep[self.n_users:, :]
+
+        cos_sim = pairwise_cosine_similarity(all_users_r, all_items_r)
+
+        del all_users_r, all_items_r
+        torch.cuda.empty_cache()
+
+        cos_sim = torch.reshape(cos_sim, (1, -1))
+        _, idx = torch.topk(cos_sim, self.aug_num)
+        del cos_sim
+        torch.cuda.empty_cache()
+
+        aug_idx = [
+            [int(torch.div(idx[0][i], self.n_items, rounding_mode='floor')), (int(torch.fmod(idx[0][i], self.n_items)))]
+            for i in range(self.aug_num)]
+
+        return aug_idx  # return list [user_id, item_id]
+
+    def cal_loss(self, users_r, aug_users_r):
+        # calcrate ssl-loss(InfoNCE)
+        loss = InfoNCE(negative_mode='unpaired')
+
+        query = users_r
+        positive_key = aug_users_r
+        negative_keys = aug_users_r
+        contrasive_loss = loss(query, positive_key, negative_keys)
+        return contrasive_loss
+    def bpr_forward(self, users, pos_items, neg_items):
+        # 普通の埋め込み
+        rep = self.get_def_rep()
+        users_r = rep[users, :]
+        pos_items_r, neg_items_r = rep[self.n_users + pos_items, :], rep[self.n_users + neg_items, :]
+        # AUG後の埋め込み
+
+        aug_rep = self.get_aug_rep(self.norm_aug_adj)
+        aug_users_r = aug_rep[users, :]
+        l2_norm_sq = torch.norm(users_r, p=2, dim=1) ** 2 + torch.norm(pos_items_r, p=2, dim=1) ** 2 \
+                     + torch.norm(neg_items_r, p=2, dim=1) ** 2
+        # Contrasive loss
+        contrasive_loss = self.cal_loss(users_r, aug_users_r)
+        return users_r, pos_items_r, neg_items_r, l2_norm_sq, contrasive_loss
+
+    def update_aug_adj(self):
+        del self.norm_aug_adj
+        torch.cuda.empty_cache()
+        # gc.collect()
+        self.norm_aug_adj = self.generate_drop_graph(self.config['dataset'])
+
+    def predict(self, users):
+        rep = self.get_def_rep()
+        users_r = rep[users, :]
+        all_items_r = rep[self.n_users:, :]
+        scores = torch.mm(users_r, all_items_r.t())
+        return scores
+
+    def save(self, path):
+        params = {'sate_dict': self.state_dict(), 'user_map': self.user_map,
+                  'item_map': self.item_map, 'alpha': self.alpha}
+        torch.save(params, path)
+
+    def load(self, path):
+        params = torch.load(path, map_location=self.device)
+        self.load_state_dict(params['sate_dict'])
+        self.user_map = params['user_map']
+        self.item_map = params['item_map']
+        self.alpha = params['alpha']
+        self.feat_mat, _, _, self.row_sum = self.generate_feat(self.config['dataset'], is_updating=True)
+        self.update_feat_mat()
+
+
+class DOSE_drop2(BasicModel):
+    def __init__(self, model_config):
+        super(DOSE_drop2, self).__init__(model_config)
+        self.embedding_size = model_config['embedding_size']
+        self.n_layers = model_config['n_layers']
+        self.dropout = model_config['dropout']
+        self.feature_ratio = model_config['feature_ratio']  # Template%
+        self.norm_adj = self.generate_graph(model_config['dataset'])
+
+        self.alpha = 1.
+        self.delta = model_config.get('delta', 0.99)
+        self.taugh = model_config.get('taugh', 0.2)
+        self.aug_rate = model_config.get('aug_rate', 0.2)
+        self.aug_num = model_config['aug_num']
+        self.aug_num = int(self.aug_num)
+        # self.temper = model_config['temper']
+        self.feat_mat, self.user_map, self.item_map, self.row_sum = \
+            self.generate_feat(model_config['dataset'],
+                               ranking_metric=model_config.get('ranking_metric', 'sort'))
+        self.update_feat_mat()
+        # self.norm_aug_adj = generate_aug_graph(model_config['dataset'] )
+        self.embedding = nn.Embedding(self.feat_mat.shape[1], self.embedding_size)
+
+        self.w = nn.Parameter(torch.ones([self.embedding_size], dtype=torch.float32, device=self.device))
+        normal_(self.embedding.weight, std=0.1)
+        self.to(device=self.device)
+        self.norm_aug_adj = self.generate_drop_graph(model_config['dataset'])
+        self.times = model_config.get('times', 0.1)
+        # self.drop_feat_mat, self.drop_user_map, self.drop_item_map, self.drop_row_sum = \
+
+            # self.generate_drop_feat(model_config['dataset'],
+                               # ranking_metric=model_config.get('ranking_metric', 'sort'))
+        # self.aug_num = (self.times) * len(self.feat_mat)
+
+    def update_feat_mat(self):
+        row, _ = self.feat_mat.indices()
+        edge_values = torch.pow(self.row_sum[row], (self.alpha - 1.) / 2. - 0.5)
+        self.feat_mat = torch.sparse.FloatTensor(self.feat_mat.indices(), edge_values, self.feat_mat.shape).coalesce()
+
+    def update_aug_feat_mat(self):
+        row, _ = self.drop_feat_mat.indices()
+        edge_values = torch.pow(self.row_sum[row], (self.alpha - 1.) / 2. - 0.5)
+        self.drop_feat_mat = torch.sparse.FloatTensor(self.drop_feat_mat.indices(), edge_values,
+                                                     self.drop_feat_mat.shape).coalesce()
+
+    def feat_mat_anneal(self):
+        self.alpha *= self.delta
+        self.update_feat_mat()
+
+    def generate_graph(self, dataset):
+        return LightGCN.generate_graph(self, dataset)
+
+    def generate_drop_graph(self, dataset):
+        # new graph after adding some interactions
+        aug_adj_mat = generate_drop_daj_mat(dataset, aug_rate=self.aug_rate)
+        degree = np.array(np.sum(aug_adj_mat, axis=1)).squeeze()
+        degree = np.maximum(1., degree)
+        d_inv = np.power(degree, -0.5)  # 累乗
+        d_mat = sp.diags(d_inv, format='csr', dtype=np.float32)
+
+        norm_aug_adj = d_mat.dot(aug_adj_mat).dot(d_mat)
+        norm_aug_adj = get_sparse_tensor(norm_aug_adj, self.device)
+        return norm_aug_adj
+
+    def generate_feat(self, dataset, is_updating=False, ranking_metric=None):
+        # return adj matrix with template
+        if not is_updating:
+            if self.feature_ratio < 1.:  # ランク付後にスライス
+
+                ranked_users, ranked_items = graph_rank_nodes(dataset, ranking_metric)
+                core_users = ranked_users[:int(self.n_users * self.feature_ratio)]
+                core_items = ranked_items[:int(self.n_items * self.feature_ratio)]
+            else:
+                core_users = np.arange(self.n_users, dtype=np.int64)
+                core_items = np.arange(self.n_items, dtype=np.int64)
+
+            user_map = dict()
+            for idx, user in enumerate(core_users):
+                user_map[user] = idx
+            item_map = dict()
+            for idx, item in enumerate(core_items):
+                item_map[item] = idx
+        else:
+            user_map = self.user_map
+            item_map = self.item_map
+
+        user_dim, item_dim = len(user_map), len(item_map)
+        indices = []
+        for user, item in dataset.train_array:
+            if item in item_map:
+                indices.append([user, user_dim + item_map[item]])
+            if user in user_map:
+                indices.append([self.n_users + item, user_map[user]])
+        for user in range(self.n_users):
+            indices.append([user, user_dim + item_dim])
+        for item in range(self.n_items):
+            indices.append([self.n_users + item, user_dim + item_dim + 1])
+        feat = sp.coo_matrix((np.ones((len(indices),)), np.array(indices).T),
+                             shape=(self.n_users + self.n_items, user_dim + item_dim + 2), dtype=np.float32).tocsr()
+        row_sum = torch.tensor(np.array(np.sum(feat, axis=1)).squeeze(), dtype=torch.float32, device=self.device)
+        feat = get_sparse_tensor(feat, self.device)
+        return feat, user_map, item_map, row_sum
+
+    def generate_drop_feat(self, dataset, is_updating=False, ranking_metric=None):
+        # return adj matrix with template
+        if not is_updating:
+            if self.feature_ratio < 1.:  # ランク付後にスライス
+
+                ranked_users, ranked_items = graph_drop_rank_nodes(dataset, ranking_metric)
+                core_users = ranked_users[:int(self.n_users * self.feature_ratio)]
+                core_items = ranked_items[:int(self.n_items * self.feature_ratio)]
+            else:
+                core_users = np.arange(self.n_users, dtype=np.int64)
+                core_items = np.arange(self.n_items, dtype=np.int64)
+
+            user_map = dict()
+            for idx, user in enumerate(core_users):
+                user_map[user] = idx
+            item_map = dict()
+            for idx, item in enumerate(core_items):
+                item_map[item] = idx
+        else:
+            user_map = self.user_map
+            item_map = self.item_map
+
+        user_dim, item_dim = len(user_map), len(item_map)
+
+        train_array = dataset.train_array
+        random.sample(train_array, int(len(train_array) * 0.5))
+        indices = []
+        for user, item in train_array:
+            if item in item_map:
+                indices.append([user, user_dim + item_map[item]])
+            if user in user_map:
+                indices.append([self.n_users + item, user_map[user]])
+        for user in range(self.n_users):
+            indices.append([user, user_dim + item_dim])
+        for item in range(self.n_items):
+            indices.append([self.n_users + item, user_dim + item_dim + 1])
+        feat = sp.coo_matrix((np.ones((len(indices),)), np.array(indices).T),
+                             shape=(self.n_users + self.n_items, user_dim + item_dim + 2), dtype=np.float32).tocsr()
+        row_sum = torch.tensor(np.array(np.sum(feat, axis=1)).squeeze(), dtype=torch.float32, device=self.device)
+        feat = get_sparse_tensor(feat, self.device)
+        return feat, user_map, item_map, row_sum
+
+    def inductive_rep_layer(self, feat_mat):
+        # generate embedding by using template
+        padding_tensor = torch.empty([max(self.feat_mat.shape) - self.feat_mat.shape[1], self.embedding_size],
+                                     dtype=torch.float32, device=self.device)
+        padding_features = torch.cat([self.embedding.weight, padding_tensor], dim=0)
+
+        row, column = feat_mat.indices()
+        g = dgl.graph((column, row), num_nodes=max(self.feat_mat.shape), device=self.device)
+        x = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=padding_features, rhs_data=feat_mat.values())
+        x = x[:self.feat_mat.shape[0], :]
+        return x
+
+    def inductive_drop_rep_layer(self, drop_feat_mat):
+        # generate embedding by using template
+        padding_tensor = torch.empty([max(self.drop_feat_mat.shape) - self.drop_feat_mat.shape[1], self.embedding_size],
+                                     dtype=torch.float32, device=self.device)
+        padding_features = torch.cat([self.embedding.weight, padding_tensor], dim=0)
+
+        row, column = drop_feat_mat.indices()
+        g = dgl.graph((column, row), num_nodes=max(self.drop_feat_mat.shape), device=self.device)
+        x = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=padding_features, rhs_data=drop_feat_mat.values())
+        x = x[:self.aug_feat_mat.shape[0], :]
+        return x
+
+    def get_def_rep(self):
+        # generate final embedding
+        feat_mat = NGCF.dropout_sp_mat(self, self.feat_mat)
+        representations = self.inductive_rep_layer(feat_mat)
+
+        all_layer_rep = [representations]
+        row, column = self.norm_adj.indices()
+        g = dgl.graph((column, row), num_nodes=self.norm_adj.shape[0], device=self.device)
+        for _ in range(self.n_layers):
+            representations = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=representations, rhs_data=self.norm_adj.values())
+            all_layer_rep.append(representations)
+        all_layer_rep = torch.stack(all_layer_rep, dim=0)
+        final_rep = all_layer_rep.mean(dim=0)
+        return final_rep
+
+    def get_aug_rep(self, norm_aug_adj):
+        # generate final embedding on aug-graph
+        feat_mat = NGCF.dropout_sp_mat(self, self.feat_mat)
+        representations = self.inductive_rep_layer(feat_mat)
+
+        all_layer_rep = [representations]
+        row, column = norm_aug_adj.indices()
+        g = dgl.graph((column, row), num_nodes=norm_aug_adj.shape[0], device=self.device)
+        for _ in range(self.n_layers):
+            representations = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=representations, rhs_data=norm_aug_adj.values())
+            all_layer_rep.append(representations)
+        all_layer_rep = torch.stack(all_layer_rep, dim=0)
+        final_rep = all_layer_rep.mean(dim=0)
+        return final_rep
+
+    def cal_cos_sim(self):
+        # calculate cosine similarity with user embeddings and item embeddings (on CPU)
+        rep = self.get_def_rep()
+        all_users_r = rep[:self.n_users, :]
+        all_items_r = rep[self.n_users:, :]
+
+        all_users_r = all_users_r.to('cpu').detach().numpy().copy()
+        all_items_r = all_items_r.to('cpu').detach().numpy().copy()
+
+        x = cosine_similarity(all_users_r, all_items_r)
+        cos_mat = torch.from_numpy(x.astype(np.float32)).clone()
+        cos_mat.to(device=self.device)
+        cos_sim = torch.reshape(cos_mat, (1, -1))
+        _, idx = torch.topk(cos_sim, self.aug_num)
+        # idx = idx.tolist()S
+        aug_idx = [
+            [int(torch.div(idx[0][i], self.n_items, rounding_mode='floor')), (int(torch.fmod(idx[0][i], self.n_items)))]
+            for i in range(self.aug_num)]
+
+        return aug_idx  # return list [user_id, item_id]
+
+    def cal_cos_sim_v2(self):
+        # calculate cosine similarity with user embeddings and item embeddings (on GPU)
+        rep = self.get_def_rep()
+        all_users_r = rep[:self.n_users, :]
+        all_items_r = rep[self.n_users:, :]
+
+        cos_sim = pairwise_cosine_similarity(all_users_r, all_items_r)
+        cos_sim = torch.reshape(cos_sim, (1, -1))
+        _, idx = torch.topk(cos_sim, self.aug_num)
+        aug_idx = [
+            [int(torch.div(idx[0][i], self.n_items, rounding_mode='floor')), (int(torch.fmod(idx[0][i], self.n_items)))]
+            for i in range(self.aug_num)]
+
+        return aug_idx  # return list [user_id, item_id]
+
+    def cal_loss(self, users_r, aug_users_r):
+        # calcrate ssl-loss(InfoNCE)
+        loss = InfoNCE(negative_mode='unpaired')
+
+        query = users_r
+        positive_key = aug_users_r
+        negative_keys = aug_users_r
+        contrasive_loss = loss(query, positive_key, negative_keys)
+        return contrasive_loss
+
+    def bpr_forward(self, users, pos_items, neg_items):
+        # 普通の埋め込み
+        rep = self.get_def_rep()
+        users_r = rep[users, :]
+        pos_items_r, neg_items_r = rep[self.n_users + pos_items, :], rep[self.n_users + neg_items, :]
+        # AUG後の埋め込み
+
+        aug_rep = self.get_aug_rep(self.norm_aug_adj)
+        aug_users_r = aug_rep[users, :]
+        l2_norm_sq = torch.norm(users_r, p=2, dim=1) ** 2 + torch.norm(pos_items_r, p=2, dim=1) ** 2 \
+                     + torch.norm(neg_items_r, p=2, dim=1) ** 2
+        # Contrasive loss
+        contrasive_loss = self.cal_loss(users_r, aug_users_r)
+        return users_r, pos_items_r, neg_items_r, l2_norm_sq, contrasive_loss
+
+
+
+    def update_aug_adj(self):
+        del self.norm_aug_adj
+        torch.cuda.empty_cache()
+        # gc.collect()
+        self.norm_aug_adj = self.generate_drop_graph(self.config['dataset'])
+
+    def predict(self, users):
+        rep = self.get_def_rep()
+        users_r = rep[users, :]
+        all_items_r = rep[self.n_users:, :]
+        scores = torch.mm(users_r, all_items_r.t())
+        return scores
+
+    def save(self, path):
+        params = {'sate_dict': self.state_dict(), 'user_map': self.user_map,
+                  'item_map': self.item_map, 'alpha': self.alpha}
+        torch.save(params, path)
+
+    def load(self, path):
+        params = torch.load(path, map_location=self.device)
+        self.load_state_dict(params['sate_dict'])
+        self.user_map = params['user_map']
+        self.item_map = params['item_map']
+        self.alpha = params['alpha']
+        self.feat_mat, _, _, self.row_sum = self.generate_feat(self.config['dataset'], is_updating=True)
+        self.update_feat_mat()
+
+class TEST(BasicModel):
+    def __init__(self, model_config):
+        super(TEST, self).__init__(model_config)
+        self.embedding_size = model_config['embedding_size']
+        self.n_layers = model_config['n_layers']
+        self.dropout = model_config['dropout']
+        self.feature_ratio = model_config['feature_ratio']  # Template%
+
+
+        self.alpha = 1.
+        self.delta = model_config.get('delta', 0.99)
+        self.taugh = model_config.get('taugh', 0.2)
+        self.aug_rate = model_config.get('aug_rate', 0.8)
+        self.aug_num = model_config['aug_num']
+        self.aug_num = int(self.aug_num)
+        # self.temper = model_config['temper']
+        self.feat_mat, self.user_map, self.item_map, self.row_sum = \
+            self.generate_feat(model_config['dataset'],
+                               ranking_metric=model_config.get('ranking_metric', 'sort'))
+        self.update_feat_mat()
+        # self.norm_aug_adj = generate_aug_graph(model_config['dataset'] )
+        self.embedding = nn.Embedding(self.feat_mat.shape[1], self.embedding_size)
+
+        self.w = nn.Parameter(torch.ones([self.embedding_size], dtype=torch.float32, device=self.device))
+        normal_(self.embedding.weight, std=0.1)
+        self.to(device=self.device)
+        self.norm_adj = self.generate_drop_graph(model_config['dataset'])
+        self.norm_aug_adj = self.generate_drop_graph(model_config['dataset'])
+        self.times = model_config.get('times', 0.1)
+        # self.drop_feat_mat, self.drop_user_map, self.drop_item_map, self.drop_row_sum = \
+
+            # self.generate_drop_feat(model_config['dataset'],
+                               # ranking_metric=model_config.get('ranking_metric', 'sort'))
+        # self.aug_num = (self.times) * len(self.feat_mat)
+
+    def update_feat_mat(self):
+        row, _ = self.feat_mat.indices()
+        edge_values = torch.pow(self.row_sum[row], (self.alpha - 1.) / 2. - 0.5)
+        self.feat_mat = torch.sparse.FloatTensor(self.feat_mat.indices(), edge_values, self.feat_mat.shape).coalesce()
+
+    def update_aug_feat_mat(self):
+        row, _ = self.drop_feat_mat.indices()
+        edge_values = torch.pow(self.row_sum[row], (self.alpha - 1.) / 2. - 0.5)
+        self.drop_feat_mat = torch.sparse.FloatTensor(self.drop_feat_mat.indices(), edge_values,
+                                                     self.drop_feat_mat.shape).coalesce()
+
+    def feat_mat_anneal(self):
+        self.alpha *= self.delta
+        self.update_feat_mat()
+
+    def generate_graph(self, dataset):
+        return LightGCN.generate_graph(self, dataset)
+
+    def generate_drop_graph(self, dataset):
+        # new graph after adding some interactions
+        aug_adj_mat = generate_drop_daj_mat(dataset, aug_rate=self.aug_rate)
+        degree = np.array(np.sum(aug_adj_mat, axis=1)).squeeze()
+        degree = np.maximum(1., degree)
+        d_inv = np.power(degree, -0.5)  # 累乗
+        d_mat = sp.diags(d_inv, format='csr', dtype=np.float32)
+
+        norm_aug_adj = d_mat.dot(aug_adj_mat).dot(d_mat)
+        norm_aug_adj = get_sparse_tensor(norm_aug_adj, self.device)
+        return norm_aug_adj
+
+    def generate_feat(self, dataset, is_updating=False, ranking_metric=None):
+        # return adj matrix with template
+        if not is_updating:
+            if self.feature_ratio < 1.:  # ランク付後にスライス
+
+                ranked_users, ranked_items = graph_rank_nodes(dataset, ranking_metric)
+                core_users = ranked_users[:int(self.n_users * self.feature_ratio)]
+                core_items = ranked_items[:int(self.n_items * self.feature_ratio)]
+            else:
+                core_users = np.arange(self.n_users, dtype=np.int64)
+                core_items = np.arange(self.n_items, dtype=np.int64)
+
+            user_map = dict()
+            for idx, user in enumerate(core_users):
+                user_map[user] = idx
+            item_map = dict()
+            for idx, item in enumerate(core_items):
+                item_map[item] = idx
+        else:
+            user_map = self.user_map
+            item_map = self.item_map
+
+        user_dim, item_dim = len(user_map), len(item_map)
+        indices = []
+        for user, item in dataset.train_array:
+            if item in item_map:
+                indices.append([user, user_dim + item_map[item]])
+            if user in user_map:
+                indices.append([self.n_users + item, user_map[user]])
+        for user in range(self.n_users):
+            indices.append([user, user_dim + item_dim])
+        for item in range(self.n_items):
+            indices.append([self.n_users + item, user_dim + item_dim + 1])
+        feat = sp.coo_matrix((np.ones((len(indices),)), np.array(indices).T),
+                             shape=(self.n_users + self.n_items, user_dim + item_dim + 2), dtype=np.float32).tocsr()
+        row_sum = torch.tensor(np.array(np.sum(feat, axis=1)).squeeze(), dtype=torch.float32, device=self.device)
+        feat = get_sparse_tensor(feat, self.device)
+        return feat, user_map, item_map, row_sum
+
+    def generate_drop_feat(self, dataset, is_updating=False, ranking_metric=None):
+        # return adj matrix with template
+        if not is_updating:
+            if self.feature_ratio < 1.:  # ランク付後にスライス
+
+                ranked_users, ranked_items = graph_drop_rank_nodes(dataset, ranking_metric)
+                core_users = ranked_users[:int(self.n_users * self.feature_ratio)]
+                core_items = ranked_items[:int(self.n_items * self.feature_ratio)]
+            else:
+                core_users = np.arange(self.n_users, dtype=np.int64)
+                core_items = np.arange(self.n_items, dtype=np.int64)
+
+            user_map = dict()
+            for idx, user in enumerate(core_users):
+                user_map[user] = idx
+            item_map = dict()
+            for idx, item in enumerate(core_items):
+                item_map[item] = idx
+        else:
+            user_map = self.user_map
+            item_map = self.item_map
+
+        user_dim, item_dim = len(user_map), len(item_map)
+
+        train_array = dataset.train_array
+        random.sample(train_array, int(len(train_array) * 0.5))
+        indices = []
+        for user, item in train_array:
+            if item in item_map:
+                indices.append([user, user_dim + item_map[item]])
+            if user in user_map:
+                indices.append([self.n_users + item, user_map[user]])
+        for user in range(self.n_users):
+            indices.append([user, user_dim + item_dim])
+        for item in range(self.n_items):
+            indices.append([self.n_users + item, user_dim + item_dim + 1])
+        feat = sp.coo_matrix((np.ones((len(indices),)), np.array(indices).T),
+                             shape=(self.n_users + self.n_items, user_dim + item_dim + 2), dtype=np.float32).tocsr()
+        row_sum = torch.tensor(np.array(np.sum(feat, axis=1)).squeeze(), dtype=torch.float32, device=self.device)
+        feat = get_sparse_tensor(feat, self.device)
+        return feat, user_map, item_map, row_sum
+
+    def inductive_rep_layer(self, feat_mat):
+        # generate embedding by using template
+        padding_tensor = torch.empty([max(self.feat_mat.shape) - self.feat_mat.shape[1], self.embedding_size],
+                                     dtype=torch.float32, device=self.device)
+        padding_features = torch.cat([self.embedding.weight, padding_tensor], dim=0)
+
+        row, column = feat_mat.indices()
+        g = dgl.graph((column, row), num_nodes=max(self.feat_mat.shape), device=self.device)
+        x = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=padding_features, rhs_data=feat_mat.values())
+        x = x[:self.feat_mat.shape[0], :]
+        return x
+
+    def inductive_drop_rep_layer(self, drop_feat_mat):
+        # generate embedding by using template
+        padding_tensor = torch.empty([max(self.drop_feat_mat.shape) - self.drop_feat_mat.shape[1], self.embedding_size],
+                                     dtype=torch.float32, device=self.device)
+        padding_features = torch.cat([self.embedding.weight, padding_tensor], dim=0)
+
+        row, column = drop_feat_mat.indices()
+        g = dgl.graph((column, row), num_nodes=max(self.drop_feat_mat.shape), device=self.device)
+        x = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=padding_features, rhs_data=drop_feat_mat.values())
+        x = x[:self.aug_feat_mat.shape[0], :]
+        return x
+
+    def get_def_rep(self):
+        # generate final embedding
+        feat_mat = NGCF.dropout_sp_mat(self, self.feat_mat)
+        representations = self.inductive_rep_layer(feat_mat)
+
+        all_layer_rep = [representations]
+        row, column = self.norm_adj.indices()
+        g = dgl.graph((column, row), num_nodes=self.norm_adj.shape[0], device=self.device)
+        for _ in range(self.n_layers):
+            representations = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=representations, rhs_data=self.norm_adj.values())
+            all_layer_rep.append(representations)
+        all_layer_rep = torch.stack(all_layer_rep, dim=0)
+        final_rep = all_layer_rep.mean(dim=0)
+        return final_rep
+
+    def get_aug_rep(self, norm_aug_adj):
+        # generate final embedding on aug-graph
+        feat_mat = NGCF.dropout_sp_mat(self, self.feat_mat)
+        representations = self.inductive_rep_layer(feat_mat)
+
+        all_layer_rep = [representations]
+        row, column = norm_aug_adj.indices()
+        g = dgl.graph((column, row), num_nodes=norm_aug_adj.shape[0], device=self.device)
+        for _ in range(self.n_layers):
+            representations = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=representations, rhs_data=norm_aug_adj.values())
+            all_layer_rep.append(representations)
+        all_layer_rep = torch.stack(all_layer_rep, dim=0)
+        final_rep = all_layer_rep.mean(dim=0)
+        return final_rep
+
+    def cal_cos_sim(self):
+        # calculate cosine similarity with user embeddings and item embeddings (on CPU)
+        rep = self.get_def_rep()
+        all_users_r = rep[:self.n_users, :]
+        all_items_r = rep[self.n_users:, :]
+
+        all_users_r = all_users_r.to('cpu').detach().numpy().copy()
+        all_items_r = all_items_r.to('cpu').detach().numpy().copy()
+
+        x = cosine_similarity(all_users_r, all_items_r)
+        cos_mat = torch.from_numpy(x.astype(np.float32)).clone()
+        cos_mat.to(device=self.device)
+        cos_sim = torch.reshape(cos_mat, (1, -1))
+        _, idx = torch.topk(cos_sim, self.aug_num)
+        # idx = idx.tolist()S
+        aug_idx = [
+            [int(torch.div(idx[0][i], self.n_items, rounding_mode='floor')), (int(torch.fmod(idx[0][i], self.n_items)))]
+            for i in range(self.aug_num)]
+
+        return aug_idx  # return list [user_id, item_id]
+
+    def cal_cos_sim_v2(self):
+        # calculate cosine similarity with user embeddings and item embeddings (on GPU)
+        rep = self.get_def_rep()
+        all_users_r = rep[:self.n_users, :]
+        all_items_r = rep[self.n_users:, :]
+
+        cos_sim = pairwise_cosine_similarity(all_users_r, all_items_r)
+        cos_sim = torch.reshape(cos_sim, (1, -1))
+        _, idx = torch.topk(cos_sim, self.aug_num)
+        aug_idx = [
+            [int(torch.div(idx[0][i], self.n_items, rounding_mode='floor')), (int(torch.fmod(idx[0][i], self.n_items)))]
+            for i in range(self.aug_num)]
+
+        return aug_idx  # return list [user_id, item_id]
+
+    def cal_loss(self, users_r, aug_users_r):
+        # calcrate ssl-loss(InfoNCE)
+        loss = InfoNCE(negative_mode='unpaired')
+
+        query = users_r
+        positive_key = aug_users_r
+        negative_keys = aug_users_r
+        contrasive_loss = loss(query, positive_key, negative_keys)
+        return contrasive_loss
+
+    def bpr_forward(self, users, pos_items, neg_items):
+        # 普通の埋め込み
+        rep = self.get_def_rep()
+        users_r = rep[users, :]
+        pos_items_r, neg_items_r = rep[self.n_users + pos_items, :], rep[self.n_users + neg_items, :]
+        # AUG後の埋め込み
+
+        aug_rep = self.get_aug_rep(self.norm_aug_adj)
+        aug_users_r = aug_rep[users, :]
+        l2_norm_sq = torch.norm(users_r, p=2, dim=1) ** 2 + torch.norm(pos_items_r, p=2, dim=1) ** 2 \
+                     + torch.norm(neg_items_r, p=2, dim=1) ** 2
+        # Contrasive loss
+        contrasive_loss = self.cal_loss(users_r, aug_users_r)
+        return users_r, pos_items_r, neg_items_r, l2_norm_sq, contrasive_loss
+
+
+
+    def update_aug_adj(self):
+        del self.norm_aug_adj
+        torch.cuda.empty_cache()
+        # gc.collect()
+        self.norm_aug_adj = self.generate_drop_graph(self.config['dataset'])
+
+    def predict(self, users):
+        rep = self.get_def_rep()
+        users_r = rep[users, :]
+        all_items_r = rep[self.n_users:, :]
+        scores = torch.mm(users_r, all_items_r.t())
+        return scores
+
+    def save(self, path):
+        params = {'sate_dict': self.state_dict(), 'user_map': self.user_map,
+                  'item_map': self.item_map, 'alpha': self.alpha}
+        torch.save(params, path)
+
+    def load(self, path):
+        params = torch.load(path, map_location=self.device)
+        self.load_state_dict(params['sate_dict'])
+        self.user_map = params['user_map']
+        self.item_map = params['item_map']
+        self.alpha = params['alpha']
+        self.feat_mat, _, _, self.row_sum = self.generate_feat(self.config['dataset'], is_updating=True)
+        self.update_feat_mat()
+
+class TEST2(BasicModel):
+    def __init__(self, model_config):
+        super(TEST2, self).__init__(model_config)
+        self.embedding_size = model_config['embedding_size']
+        self.n_layers = model_config['n_layers']
+        self.dropout = model_config['dropout']
+        self.feature_ratio = model_config['feature_ratio']  # Template%
+        self.norm_adj = self.generate_graph(model_config['dataset'])
+
+        self.alpha = 1.
+        self.delta = model_config.get('delta', 0.99)
+        self.taugh = model_config.get('taugh', 0.2)
+        self.aug_rate = model_config.get('aug_rate', 0.8)
+        self.aug_num = model_config['aug_num']
+        self.aug_num = int(self.aug_num)
+        # self.temper = model_config['temper']
+        self.feat_mat, self.user_map, self.item_map, self.row_sum = \
+            self.generate_feat(model_config['dataset'],
+                               ranking_metric=model_config.get('ranking_metric', 'sort'))
+        self.update_feat_mat()
+        # self.norm_aug_adj = generate_aug_graph(model_config['dataset'] )
+        self.embedding = nn.Embedding(self.feat_mat.shape[1], self.embedding_size)
+
+        self.w = nn.Parameter(torch.ones([self.embedding_size], dtype=torch.float32, device=self.device))
+        normal_(self.embedding.weight, std=0.1)
+        self.to(device=self.device)
+        self.norm_aug_adj1 = self.generate_drop_graph(model_config['dataset'])
+        self.norm_aug_adj2 = self.generate_drop_graph(model_config['dataset'])
+        self.times = model_config.get('times', 0.1)
+        # self.drop_feat_mat, self.drop_user_map, self.drop_item_map, self.drop_row_sum = \
+
+            # self.generate_drop_feat(model_config['dataset'],
+                               # ranking_metric=model_config.get('ranking_metric', 'sort'))
+        # self.aug_num = (self.times) * len(self.feat_mat)
+
+    def update_feat_mat(self):
+        row, _ = self.feat_mat.indices()
+        edge_values = torch.pow(self.row_sum[row], (self.alpha - 1.) / 2. - 0.5)
+        self.feat_mat = torch.sparse.FloatTensor(self.feat_mat.indices(), edge_values, self.feat_mat.shape).coalesce()
+
+    def update_aug_feat_mat(self):
+        row, _ = self.drop_feat_mat.indices()
+        edge_values = torch.pow(self.row_sum[row], (self.alpha - 1.) / 2. - 0.5)
+        self.drop_feat_mat = torch.sparse.FloatTensor(self.drop_feat_mat.indices(), edge_values,
+                                                     self.drop_feat_mat.shape).coalesce()
+
+    def feat_mat_anneal(self):
+        self.alpha *= self.delta
+        self.update_feat_mat()
+
+    def generate_graph(self, dataset):
+        return LightGCN.generate_graph(self, dataset)
+
+    def generate_drop_graph(self, dataset):
+        # new graph after adding some interactions
+        aug_adj_mat = generate_drop_daj_mat(dataset, aug_rate=self.aug_rate)
+        degree = np.array(np.sum(aug_adj_mat, axis=1)).squeeze()
+        degree = np.maximum(1., degree)
+        d_inv = np.power(degree, -0.5)  # 累乗
+        d_mat = sp.diags(d_inv, format='csr', dtype=np.float32)
+
+        norm_aug_adj = d_mat.dot(aug_adj_mat).dot(d_mat)
+        norm_aug_adj = get_sparse_tensor(norm_aug_adj, self.device)
+        return norm_aug_adj
+
+    def generate_feat(self, dataset, is_updating=False, ranking_metric=None):
+        # return adj matrix with template
+        if not is_updating:
+            if self.feature_ratio < 1.:  # ランク付後にスライス
+
+                ranked_users, ranked_items = graph_rank_nodes(dataset, ranking_metric)
+                core_users = ranked_users[:int(self.n_users * self.feature_ratio)]
+                core_items = ranked_items[:int(self.n_items * self.feature_ratio)]
+            else:
+                core_users = np.arange(self.n_users, dtype=np.int64)
+                core_items = np.arange(self.n_items, dtype=np.int64)
+
+            user_map = dict()
+            for idx, user in enumerate(core_users):
+                user_map[user] = idx
+            item_map = dict()
+            for idx, item in enumerate(core_items):
+                item_map[item] = idx
+        else:
+            user_map = self.user_map
+            item_map = self.item_map
+
+        user_dim, item_dim = len(user_map), len(item_map)
+        indices = []
+        for user, item in dataset.train_array:
+            if item in item_map:
+                indices.append([user, user_dim + item_map[item]])
+            if user in user_map:
+                indices.append([self.n_users + item, user_map[user]])
+        for user in range(self.n_users):
+            indices.append([user, user_dim + item_dim])
+        for item in range(self.n_items):
+            indices.append([self.n_users + item, user_dim + item_dim + 1])
+        feat = sp.coo_matrix((np.ones((len(indices),)), np.array(indices).T),
+                             shape=(self.n_users + self.n_items, user_dim + item_dim + 2), dtype=np.float32).tocsr()
+        row_sum = torch.tensor(np.array(np.sum(feat, axis=1)).squeeze(), dtype=torch.float32, device=self.device)
+        feat = get_sparse_tensor(feat, self.device)
+        return feat, user_map, item_map, row_sum
+
+    def generate_drop_feat(self, dataset, is_updating=False, ranking_metric=None):
+        # return adj matrix with template
+        if not is_updating:
+            if self.feature_ratio < 1.:  # ランク付後にスライス
+
+                ranked_users, ranked_items = graph_drop_rank_nodes(dataset, ranking_metric)
+                core_users = ranked_users[:int(self.n_users * self.feature_ratio)]
+                core_items = ranked_items[:int(self.n_items * self.feature_ratio)]
+            else:
+                core_users = np.arange(self.n_users, dtype=np.int64)
+                core_items = np.arange(self.n_items, dtype=np.int64)
+
+            user_map = dict()
+            for idx, user in enumerate(core_users):
+                user_map[user] = idx
+            item_map = dict()
+            for idx, item in enumerate(core_items):
+                item_map[item] = idx
+        else:
+            user_map = self.user_map
+            item_map = self.item_map
+
+        user_dim, item_dim = len(user_map), len(item_map)
+
+        train_array = dataset.train_array
+        random.sample(train_array, int(len(train_array) * 0.5))
+        indices = []
+        for user, item in train_array:
+            if item in item_map:
+                indices.append([user, user_dim + item_map[item]])
+            if user in user_map:
+                indices.append([self.n_users + item, user_map[user]])
+        for user in range(self.n_users):
+            indices.append([user, user_dim + item_dim])
+        for item in range(self.n_items):
+            indices.append([self.n_users + item, user_dim + item_dim + 1])
+        feat = sp.coo_matrix((np.ones((len(indices),)), np.array(indices).T),
+                             shape=(self.n_users + self.n_items, user_dim + item_dim + 2), dtype=np.float32).tocsr()
+        row_sum = torch.tensor(np.array(np.sum(feat, axis=1)).squeeze(), dtype=torch.float32, device=self.device)
+        feat = get_sparse_tensor(feat, self.device)
+        return feat, user_map, item_map, row_sum
+
+    def inductive_rep_layer(self, feat_mat):
+        # generate embedding by using template
+        padding_tensor = torch.empty([max(self.feat_mat.shape) - self.feat_mat.shape[1], self.embedding_size],
+                                     dtype=torch.float32, device=self.device)
+        padding_features = torch.cat([self.embedding.weight, padding_tensor], dim=0)
+
+        row, column = feat_mat.indices()
+        g = dgl.graph((column, row), num_nodes=max(self.feat_mat.shape), device=self.device)
+        x = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=padding_features, rhs_data=feat_mat.values())
+        x = x[:self.feat_mat.shape[0], :]
+        return x
+
+    def inductive_drop_rep_layer(self, drop_feat_mat):
+        # generate embedding by using template
+        padding_tensor = torch.empty([max(self.drop_feat_mat.shape) - self.drop_feat_mat.shape[1], self.embedding_size],
+                                     dtype=torch.float32, device=self.device)
+        padding_features = torch.cat([self.embedding.weight, padding_tensor], dim=0)
+
+        row, column = drop_feat_mat.indices()
+        g = dgl.graph((column, row), num_nodes=max(self.drop_feat_mat.shape), device=self.device)
+        x = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=padding_features, rhs_data=drop_feat_mat.values())
+        x = x[:self.aug_feat_mat.shape[0], :]
+        return x
+
+    def get_def_rep(self):
+        # generate final embedding
+        feat_mat = NGCF.dropout_sp_mat(self, self.feat_mat)
+        representations = self.inductive_rep_layer(feat_mat)
+
+        all_layer_rep = [representations]
+        row, column = self.norm_adj.indices()
+        g = dgl.graph((column, row), num_nodes=self.norm_adj.shape[0], device=self.device)
+        for _ in range(self.n_layers):
+            representations = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=representations, rhs_data=self.norm_adj.values())
+            all_layer_rep.append(representations)
+        all_layer_rep = torch.stack(all_layer_rep, dim=0)
+        final_rep = all_layer_rep.mean(dim=0)
+        return final_rep
+
+    def get_aug_rep(self, norm_aug_adj):
+        # generate final embedding on aug-graph
+        feat_mat = NGCF.dropout_sp_mat(self, self.feat_mat)
+        representations = self.inductive_rep_layer(feat_mat)
+
+        all_layer_rep = [representations]
+        row, column = norm_aug_adj.indices()
+        g = dgl.graph((column, row), num_nodes=norm_aug_adj.shape[0], device=self.device)
+        for _ in range(self.n_layers):
+            representations = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=representations, rhs_data=norm_aug_adj.values())
+            all_layer_rep.append(representations)
+        all_layer_rep = torch.stack(all_layer_rep, dim=0)
+        final_rep = all_layer_rep.mean(dim=0)
+        return final_rep
+
+    def cal_cos_sim(self):
+        # calculate cosine similarity with user embeddings and item embeddings (on CPU)
+        rep = self.get_def_rep()
+        all_users_r = rep[:self.n_users, :]
+        all_items_r = rep[self.n_users:, :]
+
+        all_users_r = all_users_r.to('cpu').detach().numpy().copy()
+        all_items_r = all_items_r.to('cpu').detach().numpy().copy()
+
+        x = cosine_similarity(all_users_r, all_items_r)
+        cos_mat = torch.from_numpy(x.astype(np.float32)).clone()
+        cos_mat.to(device=self.device)
+        cos_sim = torch.reshape(cos_mat, (1, -1))
+        _, idx = torch.topk(cos_sim, self.aug_num)
+        # idx = idx.tolist()S
+        aug_idx = [
+            [int(torch.div(idx[0][i], self.n_items, rounding_mode='floor')), (int(torch.fmod(idx[0][i], self.n_items)))]
+            for i in range(self.aug_num)]
+
+        return aug_idx  # return list [user_id, item_id]
+
+    def cal_cos_sim_v2(self):
+        # calculate cosine similarity with user embeddings and item embeddings (on GPU)
+        rep = self.get_def_rep()
+        all_users_r = rep[:self.n_users, :]
+        all_items_r = rep[self.n_users:, :]
+
+        cos_sim = pairwise_cosine_similarity(all_users_r, all_items_r)
+        cos_sim = torch.reshape(cos_sim, (1, -1))
+        _, idx = torch.topk(cos_sim, self.aug_num)
+        aug_idx = [
+            [int(torch.div(idx[0][i], self.n_items, rounding_mode='floor')), (int(torch.fmod(idx[0][i], self.n_items)))]
+            for i in range(self.aug_num)]
+
+        return aug_idx  # return list [user_id, item_id]
+
+    def cal_loss(self, users_r, aug_users_r):
+        # calcrate ssl-loss(InfoNCE)
+        loss = InfoNCE(negative_mode='unpaired')
+
+        query = users_r
+        positive_key = aug_users_r
+        negative_keys = aug_users_r
+        contrasive_loss = loss(query, positive_key, negative_keys)
+        return contrasive_loss
+
+    def bpr_forward(self, users, pos_items, neg_items):
+        # 普通の埋め込み
+        rep = self.get_def_rep()
+        users_r = rep[users, :]
+        pos_items_r, neg_items_r = rep[self.n_users + pos_items, :], rep[self.n_users + neg_items, :]
+        # AUG後の埋め込み
+
+        aug_rep1 = self.get_aug_rep(self.norm_aug_adj1)
+        aug_users_r1 = aug_rep1[users, :]
+        aug_rep2 = self.get_aug_rep(self.norm_aug_adj2)
+        aug_users_r2 = aug_rep2[users, :]
+        l2_norm_sq = torch.norm(users_r, p=2, dim=1) ** 2 + torch.norm(pos_items_r, p=2, dim=1) ** 2 \
+                     + torch.norm(neg_items_r, p=2, dim=1) ** 2
+        # Contrasive loss
+        contrasive_loss = self.cal_loss(aug_users_r1, aug_users_r2)
+        return users_r, pos_items_r, neg_items_r, l2_norm_sq, contrasive_loss
+
+
+
+    def update_aug_adj(self):
+        del self.norm_aug_adj1, self.norm_aug_adj2
+        torch.cuda.empty_cache()
+        # gc.collect()
+        self.norm_aug_adj1 = self.generate_drop_graph(self.config['dataset'])
+        self.norm_aug_adj2 = self.generate_drop_graph(self.config['dataset'])
+    def predict(self, users):
+        rep = self.get_def_rep()
+        users_r = rep[users, :]
+        all_items_r = rep[self.n_users:, :]
+        scores = torch.mm(users_r, all_items_r.t())
+        return scores
+
+    def save(self, path):
+        params = {'sate_dict': self.state_dict(), 'user_map': self.user_map,
+                  'item_map': self.item_map, 'alpha': self.alpha}
+        torch.save(params, path)
+
+    def load(self, path):
+        params = torch.load(path, map_location=self.device)
+        self.load_state_dict(params['sate_dict'])
+        self.user_map = params['user_map']
+        self.item_map = params['item_map']
+        self.alpha = params['alpha']
+        self.feat_mat, _, _, self.row_sum = self.generate_feat(self.config['dataset'], is_updating=True)
+        self.update_feat_mat()
+class DOSE_drop3(BasicModel):
+    def __init__(self, model_config):
+        super(DOSE_drop3, self).__init__(model_config)
+        self.embedding_size = model_config['embedding_size']
+        self.n_layers = model_config['n_layers']
+        self.dropout = model_config['dropout']
+        self.feature_ratio = model_config['feature_ratio']  # Template%
+        self.norm_adj = self.generate_graph(model_config['dataset'])
+
+        self.alpha = 1.
+        self.delta = model_config.get('delta', 0.99)
+        self.taugh = model_config.get('taugh', 0.2)
+        self.aug_num = model_config['aug_num']
+        self.aug_num = int(self.aug_num)
+        # self.temper = model_config['temper']
+        self.feat_mat, self.user_map, self.item_map, self.row_sum = \
+            self.generate_feat(model_config['dataset'],
+                               ranking_metric=model_config.get('ranking_metric', 'sort'))
+        self.update_feat_mat()
+        # self.norm_aug_adj = generate_aug_graph(model_config['dataset'] )
+        self.embedding = nn.Embedding(self.feat_mat.shape[1], self.embedding_size)
+
+        self.w = nn.Parameter(torch.ones([self.embedding_size], dtype=torch.float32, device=self.device))
+        normal_(self.embedding.weight, std=0.1)
+        self.to(device=self.device)
+        self.norm_aug_adj = self.generate_drop_graph(model_config['dataset'])
+        self.times = model_config.get('times', 0.1)
+        # self.drop_feat_mat, self.drop_user_map, self.drop_item_map, self.drop_row_sum = \
+            # self.generate_drop_feat(model_config['dataset'],
+                               # ranking_metric=model_config.get('ranking_metric', 'sort'))
+        # self.aug_num = (self.times) * len(self.feat_mat)
+
+    def update_feat_mat(self):
+        row, _ = self.feat_mat.indices()
+        edge_values = torch.pow(self.row_sum[row], (self.alpha - 1.) / 2. - 0.5)
+        self.feat_mat = torch.sparse.FloatTensor(self.feat_mat.indices(), edge_values, self.feat_mat.shape).coalesce()
+
+    def update_aug_feat_mat(self):
+        row, _ = self.drop_feat_mat.indices()
+        edge_values = torch.pow(self.row_sum[row], (self.alpha - 1.) / 2. - 0.5)
+        self.drop_feat_mat = torch.sparse.FloatTensor(self.drop_feat_mat.indices(), edge_values,
+                                                     self.drop_feat_mat.shape).coalesce()
+
+    def feat_mat_anneal(self):
+        self.alpha *= self.delta
+        self.update_feat_mat()
+    def update_aug_adj(self):
+        del self.norm_aug_adj
+        torch.cuda.empty_cache()
+        gc.collect()
+        self.norm_aug_adj = self.generate_drop_graph(self.config['dataset'])
+
+    def generate_graph(self, dataset):
+        return LightGCN.generate_graph(self, dataset)
+
+    def generate_drop_graph(self, dataset):
+        # new graph after adding some interactions
+        aug_idx = self.cal_cos_sim()
+        aug_adj_mat = generate_drop_daj_mat3(dataset, aug_idx)
+        degree = np.array(np.sum(aug_adj_mat, axis=1)).squeeze()
+        degree = np.maximum(1., degree)
+        d_inv = np.power(degree, -0.5)  # 累乗
+        d_mat = sp.diags(d_inv, format='csr', dtype=np.float32)
+
+        norm_aug_adj = d_mat.dot(aug_adj_mat).dot(d_mat)
+        norm_aug_adj = get_sparse_tensor(norm_aug_adj, self.device)
+        return norm_aug_adj
+
+    def generate_feat(self, dataset, is_updating=False, ranking_metric=None):
+        # return adj matrix with template
+        if not is_updating:
+            if self.feature_ratio < 1.:  # ランク付後にスライス
+
+                ranked_users, ranked_items = graph_rank_nodes(dataset, ranking_metric)
+                core_users = ranked_users[:int(self.n_users * self.feature_ratio)]
+                core_items = ranked_items[:int(self.n_items * self.feature_ratio)]
+            else:
+                core_users = np.arange(self.n_users, dtype=np.int64)
+                core_items = np.arange(self.n_items, dtype=np.int64)
+
+            user_map = dict()
+            for idx, user in enumerate(core_users):
+                user_map[user] = idx
+            item_map = dict()
+            for idx, item in enumerate(core_items):
+                item_map[item] = idx
+        else:
+            user_map = self.user_map
+            item_map = self.item_map
+
+        user_dim, item_dim = len(user_map), len(item_map)
+        indices = []
+        for user, item in dataset.train_array:
+            if item in item_map:
+                indices.append([user, user_dim + item_map[item]])
+            if user in user_map:
+                indices.append([self.n_users + item, user_map[user]])
+        for user in range(self.n_users):
+            indices.append([user, user_dim + item_dim])
+        for item in range(self.n_items):
+            indices.append([self.n_users + item, user_dim + item_dim + 1])
+        feat = sp.coo_matrix((np.ones((len(indices),)), np.array(indices).T),
+                             shape=(self.n_users + self.n_items, user_dim + item_dim + 2), dtype=np.float32).tocsr()
+        row_sum = torch.tensor(np.array(np.sum(feat, axis=1)).squeeze(), dtype=torch.float32, device=self.device)
+        feat = get_sparse_tensor(feat, self.device)
+        return feat, user_map, item_map, row_sum
+
+    def generate_drop_feat(self, dataset, is_updating=False, ranking_metric=None):
+        # return adj matrix with template
+        if not is_updating:
+            if self.feature_ratio < 1.:  # ランク付後にスライス
+
+                ranked_users, ranked_items = graph_drop_rank_nodes(dataset, ranking_metric)
+                core_users = ranked_users[:int(self.n_users * self.feature_ratio)]
+                core_items = ranked_items[:int(self.n_items * self.feature_ratio)]
+            else:
+                core_users = np.arange(self.n_users, dtype=np.int64)
+                core_items = np.arange(self.n_items, dtype=np.int64)
+
+            user_map = dict()
+            for idx, user in enumerate(core_users):
+                user_map[user] = idx
+            item_map = dict()
+            for idx, item in enumerate(core_items):
+                item_map[item] = idx
+        else:
+            user_map = self.user_map
+            item_map = self.item_map
+
+        user_dim, item_dim = len(user_map), len(item_map)
+
+        train_array = dataset.train_array
+        random.sample(train_array, int(len(train_array) * 0.5))
+        indices = []
+        for user, item in train_array:
+            if item in item_map:
+                indices.append([user, user_dim + item_map[item]])
+            if user in user_map:
+                indices.append([self.n_users + item, user_map[user]])
+        for user in range(self.n_users):
+            indices.append([user, user_dim + item_dim])
+        for item in range(self.n_items):
+            indices.append([self.n_users + item, user_dim + item_dim + 1])
+        feat = sp.coo_matrix((np.ones((len(indices),)), np.array(indices).T),
+                             shape=(self.n_users + self.n_items, user_dim + item_dim + 2), dtype=np.float32).tocsr()
+        row_sum = torch.tensor(np.array(np.sum(feat, axis=1)).squeeze(), dtype=torch.float32, device=self.device)
+        feat = get_sparse_tensor(feat, self.device)
+        return feat, user_map, item_map, row_sum
+
+    def inductive_rep_layer(self, feat_mat):
+        # generate embedding by using template
+        padding_tensor = torch.empty([max(self.feat_mat.shape) - self.feat_mat.shape[1], self.embedding_size],
+                                     dtype=torch.float32, device=self.device)
+        padding_features = torch.cat([self.embedding.weight, padding_tensor], dim=0)
+
+        row, column = feat_mat.indices()
+        g = dgl.graph((column, row), num_nodes=max(self.feat_mat.shape), device=self.device)
+        x = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=padding_features, rhs_data=feat_mat.values())
+        x = x[:self.feat_mat.shape[0], :]
+        return x
+
+    def inductive_drop_rep_layer(self, drop_feat_mat):
+        # generate embedding by using template
+        padding_tensor = torch.empty([max(self.drop_feat_mat.shape) - self.drop_feat_mat.shape[1], self.embedding_size],
+                                     dtype=torch.float32, device=self.device)
+        padding_features = torch.cat([self.embedding.weight, padding_tensor], dim=0)
+
+        row, column = drop_feat_mat.indices()
+        g = dgl.graph((column, row), num_nodes=max(self.drop_feat_mat.shape), device=self.device)
+        x = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=padding_features, rhs_data=drop_feat_mat.values())
+        x = x[:self.aug_feat_mat.shape[0], :]
+        return x
+
+    def get_def_rep(self):
+        # generate final embedding
+        feat_mat = NGCF.dropout_sp_mat(self, self.feat_mat)
+        representations = self.inductive_rep_layer(feat_mat)
+
+        all_layer_rep = [representations]
+        row, column = self.norm_adj.indices()
+        g = dgl.graph((column, row), num_nodes=self.norm_adj.shape[0], device=self.device)
+        for _ in range(self.n_layers):
+            representations = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=representations, rhs_data=self.norm_adj.values())
+            all_layer_rep.append(representations)
+        all_layer_rep = torch.stack(all_layer_rep, dim=0)
+        final_rep = all_layer_rep.mean(dim=0)
+        return final_rep
+
+    def get_aug_rep(self, norm_aug_adj):
+        # generate final embedding on aug-graph
+        feat_mat = NGCF.dropout_sp_mat(self, self.feat_mat)
+        representations = self.inductive_rep_layer(feat_mat)
+
+        all_layer_rep = [representations]
+        row, column = norm_aug_adj.indices()
+        g = dgl.graph((column, row), num_nodes=norm_aug_adj.shape[0], device=self.device)
+        for _ in range(self.n_layers):
+            representations = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=representations, rhs_data=norm_aug_adj.values())
+            all_layer_rep.append(representations)
+        all_layer_rep = torch.stack(all_layer_rep, dim=0)
+        final_rep = all_layer_rep.mean(dim=0)
+        return final_rep
+
+    def cal_cos_sim(self):
+        # calculate cosine similarity with user embeddings and item embeddings (on CPU)
+
+        rep = self.get_def_rep()
+        all_users_r = rep[:self.n_users, :]
+        all_items_r = rep[self.n_users:, :]
+        all_items_r *= -1
+
+        all_user_r = all_users_r.to('cpu').detach().numpy().copy()
+        all_item_r = all_items_r.to('cpu').detach().numpy().copy()
+
+        x = cosine_similarity(all_user_r, all_item_r)
+
+        del all_users_r, all_items_r
+        del all_user_r, all_item_r
+        torch.cuda.empty_cache()
+
+        cos_mat = torch.from_numpy(x.astype(np.float32)).clone()
+        cos_mat.to(device=self.device)
+        cos_mat = torch.reshape(cos_mat, (1, -1))
+        cos_mat = torch.squeeze(cos_mat)
+        cos_mat1 = cos_mat[:len(cos_mat) // 2]
+        _, idx1 = torch.topk(cos_mat1, self.aug_num // 2)
+        cos_mat2 = cos_mat[len(cos_mat) // 2:]
+
+        del cos_mat
+        torch.cuda.empty_cache()
+        # gc.collect()
+        print(len(cos_mat2))
+        _, idx2 = torch.topk(cos_mat2, self.aug_num // 2)
+        # idx = idx.tolist()S
+        aug_idx1 = [[int(torch.div(idx1[i], self.n_items, rounding_mode='floor')),
+                     (int(torch.fmod(idx1[i], self.n_items)))] for i in range(self.aug_num // 2)]
+        # aug_idx.to(device=self.device)
+        aug_idx2 = [
+            [int(torch.div(idx2[i] + self.aug_num // 2, self.n_items, rounding_mode='floor')),
+             (int(torch.fmod(idx2[i] + self.aug_num // 2, self.n_items)))] for i
+            in range(self.aug_num // 2)]
+        aug_idx1.extend(aug_idx2)
+        del aug_idx2, idx1, idx2
+        torch.cuda.empty_cache()
+
+        return aug_idx1  # return list [user_id, item_id]
+
+    def cal_cos_sim_v2(self):
+        # calculate cosine similarity with user embeddings and item embeddings (on GPU)
+        rep = self.get_def_rep()
+        all_users_r = rep[:self.n_users, :]
+        all_items_r = rep[self.n_users:, :]
+
+        cos_sim = pairwise_cosine_similarity(all_users_r, all_items_r)
+
+        del all_users_r, all_items_r
+        torch.cuda.empty_cache()
+
+        cos_sim = torch.reshape(cos_sim, (1, -1))
+        _, idx = torch.topk(cos_sim, self.aug_num)
+        del cos_sim
+        torch.cuda.empty_cache()
+
+        aug_idx = [
+            [int(torch.div(idx[0][i], self.n_items, rounding_mode='floor')), (int(torch.fmod(idx[0][i], self.n_items)))]
+            for i in range(self.aug_num)]
+
+        return aug_idx  # return list [user_id, item_id]
+
+    def cal_loss(self, users_r, aug_users_r):
+        # calcrate ssl-loss(InfoNCE)
+        loss = InfoNCE(negative_mode='unpaired')
+
+        query = users_r
+        positive_key = aug_users_r
+        negative_keys = aug_users_r
+        contrasive_loss = loss(query, positive_key, negative_keys)
+        return contrasive_loss
+    def bpr_forward(self, users, pos_items, neg_items):
+        # 普通の埋め込み
+        rep = self.get_def_rep()
+        users_r = rep[users, :]
+        pos_items_r, neg_items_r = rep[self.n_users + pos_items, :], rep[self.n_users + neg_items, :]
+        # AUG後の埋め込み
+
+        aug_rep = self.get_aug_rep(self.norm_aug_adj)
+        aug_users_r = aug_rep[users, :]
+        l2_norm_sq = torch.norm(users_r, p=2, dim=1) ** 2 + torch.norm(pos_items_r, p=2, dim=1) ** 2 \
+                     + torch.norm(neg_items_r, p=2, dim=1) ** 2
+        # Contrasive loss
+        contrasive_loss = self.cal_loss(users_r, aug_users_r)
+        return users_r, pos_items_r, neg_items_r, l2_norm_sq, contrasive_loss
+
+    def update_aug_adj(self):
+        del self.norm_aug_adj
+        torch.cuda.empty_cache()
+        # gc.collect()
+        self.norm_aug_adj = self.generate_drop_graph(self.config['dataset'])
+
+    def predict(self, users):
+        rep = self.get_def_rep()
+        users_r = rep[users, :]
+        all_items_r = rep[self.n_users:, :]
+        scores = torch.mm(users_r, all_items_r.t())
+        return scores
+
+    def save(self, path):
+        params = {'sate_dict': self.state_dict(), 'user_map': self.user_map,
+                  'item_map': self.item_map, 'alpha': self.alpha}
+        torch.save(params, path)
+
+    def load(self, path):
+        params = torch.load(path, map_location=self.device)
+        self.load_state_dict(params['sate_dict'])
+        self.user_map = params['user_map']
+        self.item_map = params['item_map']
+        self.alpha = params['alpha']
+        self.feat_mat, _, _, self.row_sum = self.generate_feat(self.config['dataset'], is_updating=True)
+        self.update_feat_mat()
+
+
+class DOSE_aug_drop(BasicModel):
+    def __init__(self, model_config):
+        super(DOSE_aug_drop, self).__init__(model_config)
+        self.embedding_size = model_config['embedding_size']
+        self.n_layers = model_config['n_layers']
+        self.dropout = model_config['dropout']
+        self.feature_ratio = model_config['feature_ratio']  # Template%
+        self.norm_adj = self.generate_graph(model_config['dataset'])
+
+        self.alpha = 1.
+        self.delta = model_config.get('delta', 0.99)
+        self.taugh = model_config.get('taugh', 0.2)
+        self.aug_rate = model_config.get('aug_rate', 0.8)
+        self.aug_num = model_config['aug_num']
+        # self.temper = model_config['temper']
+        self.feat_mat, self.user_map, self.item_map, self.row_sum = \
+            self.generate_feat(model_config['dataset'],
+                               ranking_metric=model_config.get('ranking_metric', 'sort'))
+        self.update_feat_mat()
+        # self.norm_aug_adj = generate_aug_graph(model_config['dataset'] )
+        self.embedding = nn.Embedding(self.feat_mat.shape[1], self.embedding_size)
+
+        self.w = nn.Parameter(torch.ones([self.embedding_size], dtype=torch.float32, device=self.device))
+        normal_(self.embedding.weight, std=0.1)
+        self.to(device=self.device)
+        self.norm_aug_adj = self.generate_aug_graph(model_config['dataset'])
+        self.norm_drop_adj = self.generate_drop_graph(model_config['dataset'])
+        self.times = model_config.get('times', 0.1)
+        # self.aug_num = (self.times) * len(self.feat_mat)
+
+    def update_feat_mat(self):
+        row, _ = self.feat_mat.indices()
+        edge_values = torch.pow(self.row_sum[row], (self.alpha - 1.) / 2. - 0.5)
+        self.feat_mat = torch.sparse.FloatTensor(self.feat_mat.indices(), edge_values, self.feat_mat.shape).coalesce()
+
+    def feat_mat_anneal(self):
+        self.alpha *= self.delta
+        self.update_feat_mat()
+
+    def generate_graph(self, dataset):
+        return LightGCN.generate_graph(self, dataset)
+
+    def generate_aug_graph(self, dataset):
+        # new graph after adding some interactions
+        user_id = np.random.randint(0, self.n_users, self.aug_num)
+        item_id = np.random.randint(0, self.n_items, self.aug_num)
+        aug_idx = np.stack([user_id, item_id], 1)
+        aug_idx = aug_idx.tolist()
+        aug_adj_mat = generate_aug_daj_mat(dataset, aug_idx)
+        degree = np.array(np.sum(aug_adj_mat, axis=1)).squeeze()
+        degree = np.maximum(1., degree)
+        d_inv = np.power(degree, -0.5)  # 累乗
+        d_mat = sp.diags(d_inv, format='csr', dtype=np.float32)
+
+        norm_aug_adj = d_mat.dot(aug_adj_mat).dot(d_mat)
+        norm_aug_adj = get_sparse_tensor(norm_aug_adj, self.device)
+
+        return norm_aug_adj
+
+
+
+    def generate_drop_graph(self, dataset):
+        # new graph after adding some interactions
+        aug_adj_mat = generate_drop_daj_mat(dataset, aug_rate=self.aug_rate)
+        degree = np.array(np.sum(aug_adj_mat, axis=1)).squeeze()
+        degree = np.maximum(1., degree)
+        d_inv = np.power(degree, -0.5)  # 累乗
+        d_mat = sp.diags(d_inv, format='csr', dtype=np.float32)
+
+        norm_aug_adj = d_mat.dot(aug_adj_mat).dot(d_mat)
+        norm_aug_adj = get_sparse_tensor(norm_aug_adj, self.device)
+        return norm_aug_adj
+
+
+    def generate_feat(self, dataset, is_updating=False, ranking_metric=None):
+        # return adj matrix with template
+        if not is_updating:
+            if self.feature_ratio < 1.:  # ランク付後にスライス
+
+                ranked_users, ranked_items = graph_rank_nodes(dataset, ranking_metric)
+                core_users = ranked_users[:int(self.n_users * self.feature_ratio)]
+                core_items = ranked_items[:int(self.n_items * self.feature_ratio)]
+            else:
+                core_users = np.arange(self.n_users, dtype=np.int64)
+                core_items = np.arange(self.n_items, dtype=np.int64)
+
+            user_map = dict()
+            for idx, user in enumerate(core_users):
+                user_map[user] = idx
+            item_map = dict()
+            for idx, item in enumerate(core_items):
+                item_map[item] = idx
+        else:
+            user_map = self.user_map
+            item_map = self.item_map
+
+        user_dim, item_dim = len(user_map), len(item_map)
+        indices = []
+        for user, item in dataset.train_array:
+            if item in item_map:
+                indices.append([user, user_dim + item_map[item]])
+            if user in user_map:
+                indices.append([self.n_users + item, user_map[user]])
+        for user in range(self.n_users):
+            indices.append([user, user_dim + item_dim])
+        for item in range(self.n_items):
+            indices.append([self.n_users + item, user_dim + item_dim + 1])
+        feat = sp.coo_matrix((np.ones((len(indices),)), np.array(indices).T),
+                             shape=(self.n_users + self.n_items, user_dim + item_dim + 2), dtype=np.float32).tocsr()
+        row_sum = torch.tensor(np.array(np.sum(feat, axis=1)).squeeze(), dtype=torch.float32, device=self.device)
+        feat = get_sparse_tensor(feat, self.device)
+        return feat, user_map, item_map, row_sum
+
+    def cal_cos_sim(self):
+        # calculate cosine similarity with user embeddings and item embeddings (on CPU)
+
+        rep = self.get_def_rep()
+        all_users_r = rep[:self.n_users, :]
+        all_items_r = rep[self.n_users:, :]
+
+        all_user_r = all_users_r.to('cpu').detach().numpy().copy()
+        all_item_r = all_items_r.to('cpu').detach().numpy().copy()
+
+        x = cosine_similarity(all_user_r, all_item_r)
+
+        del all_users_r, all_items_r
+        del all_user_r, all_item_r
+        torch.cuda.empty_cache()
+
+        cos_mat = torch.from_numpy(x.astype(np.float32)).clone()
+        cos_mat.to(device=self.device)
+        cos_mat = torch.reshape(cos_mat, (1, -1))
+        cos_mat = torch.squeeze(cos_mat)
+        cos_mat1 = cos_mat[:len(cos_mat) // 2]
+        _, idx1 = torch.topk(cos_mat1, self.aug_num // 2)
+        cos_mat2 = cos_mat[len(cos_mat) // 2:]
+
+        del cos_mat
+        torch.cuda.empty_cache()
+        # gc.collect()
+        print(len(cos_mat2))
+        _, idx2 = torch.topk(cos_mat2, self.aug_num // 2)
+        # idx = idx.tolist()S
+        aug_idx1 = [[int(torch.div(idx1[i], self.n_items, rounding_mode='floor')),
+                     (int(torch.fmod(idx1[i], self.n_items)))] for i in range(self.aug_num // 2)]
+        # aug_idx.to(device=self.device)
+        aug_idx2 = [
+            [int(torch.div(idx2[i] + self.aug_num // 2, self.n_items, rounding_mode='floor')),
+             (int(torch.fmod(idx2[i] + self.aug_num // 2, self.n_items)))] for i
+            in range(self.aug_num // 2)]
+        aug_idx1.extend(aug_idx2)
+        del aug_idx2, idx1, idx2
+        torch.cuda.empty_cache()
+
+        return aug_idx1  # return list [user_id, item_id]
+
+
+    def cal_cos_simv2(self):
+        # calculate cosine similarity with user embeddings and item embeddings (on CPU)
+
+        rep = self.get_def_rep()
+        all_users_r = rep[:self.n_users, :]
+        all_items_r = rep[self.n_users:, :]
+        all_items_r *= -1
+
+        all_user_r = all_users_r.to('cpu').detach().numpy().copy()
+        all_item_r = all_items_r.to('cpu').detach().numpy().copy()
+
+        x = cosine_similarity(all_user_r, all_item_r)
+
+        del all_users_r, all_items_r
+        del all_user_r, all_item_r
+        torch.cuda.empty_cache()
+
+        cos_mat = torch.from_numpy(x.astype(np.float32)).clone()
+        cos_mat.to(device=self.device)
+        cos_mat = torch.reshape(cos_mat, (1, -1))
+        cos_mat = torch.squeeze(cos_mat)
+        cos_mat1 = cos_mat[:len(cos_mat) // 2]
+        _, idx1 = torch.topk(cos_mat1, self.aug_num // 2)
+        cos_mat2 = cos_mat[len(cos_mat) // 2:]
+
+        del cos_mat
+        torch.cuda.empty_cache()
+        # gc.collect()
+        print(len(cos_mat2))
+        _, idx2 = torch.topk(cos_mat2, self.aug_num // 2)
+        # idx = idx.tolist()S
+        aug_idx1 = [[int(torch.div(idx1[i], self.n_items, rounding_mode='floor')),
+                     (int(torch.fmod(idx1[i], self.n_items)))] for i in range(self.aug_num // 2)]
+        # aug_idx.to(device=self.device)
+        aug_idx2 = [
+            [int(torch.div(idx2[i] + self.aug_num // 2, self.n_items, rounding_mode='floor')),
+             (int(torch.fmod(idx2[i] + self.aug_num // 2, self.n_items)))] for i
+            in range(self.aug_num // 2)]
+        aug_idx1.extend(aug_idx2)
+        del aug_idx2, idx1, idx2
+        torch.cuda.empty_cache()
+
+        return aug_idx1  # return list [user_id, item_id]
+
+    def inductive_rep_layer(self, feat_mat):
+        # generate embedding by using template
+        padding_tensor = torch.empty([max(self.feat_mat.shape) - self.feat_mat.shape[1], self.embedding_size],
+                                     dtype=torch.float32, device=self.device)
+        padding_features = torch.cat([self.embedding.weight, padding_tensor], dim=0)
+
+        row, column = feat_mat.indices()
+        g = dgl.graph((column, row), num_nodes=max(self.feat_mat.shape), device=self.device)
+        x = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=padding_features, rhs_data=feat_mat.values())
+        x = x[:self.feat_mat.shape[0], :]
+        return x
+
+    def get_def_rep(self):
+        # generate final embedding
+        feat_mat = NGCF.dropout_sp_mat(self, self.feat_mat)
+        representations = self.inductive_rep_layer(feat_mat)
+
+        all_layer_rep = [representations]
+        row, column = self.norm_adj.indices()
+        g = dgl.graph((column, row), num_nodes=self.norm_adj.shape[0], device=self.device)
+        for _ in range(self.n_layers):
+            representations = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=representations, rhs_data=self.norm_adj.values())
+            all_layer_rep.append(representations)
+        all_layer_rep = torch.stack(all_layer_rep, dim=0)
+        final_rep = all_layer_rep.mean(dim=0)
+        return final_rep
+    def get_aug_rep(self, norm_aug_adj):
+        # generate final embedding
+        feat_mat = NGCF.dropout_sp_mat(self, self.feat_mat)
+        representations = self.inductive_rep_layer(feat_mat)
+
+        all_layer_rep = [representations]
+        row, column = norm_aug_adj.indices()
+        g = dgl.graph((column, row), num_nodes=norm_aug_adj.shape[0], device=self.device)
+        for _ in range(self.n_layers):
+            representations = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=representations, rhs_data=norm_aug_adj.values())
+            all_layer_rep.append(representations)
+        all_layer_rep = torch.stack(all_layer_rep, dim=0)
+        final_rep = all_layer_rep.mean(dim=0)
+        return final_rep
+
+    def get_drop_rep(self, norm_drop_adj):
+        # generate final embedding on aug-graph
+        feat_mat = NGCF.dropout_sp_mat(self, self.feat_mat)
+        representations = self.inductive_rep_layer(feat_mat)
+
+        all_layer_rep = [representations]
+        row, column = norm_drop_adj.indices()
+        g = dgl.graph((column, row), num_nodes=norm_drop_adj.shape[0], device=self.device)
+        for _ in range(self.n_layers):
+            representations = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=representations, rhs_data=norm_drop_adj.values())
+            all_layer_rep.append(representations)
+        all_layer_rep = torch.stack(all_layer_rep, dim=0)
+        final_rep = all_layer_rep.mean(dim=0)
+        return final_rep
+
+    def cal_loss(self, users_r, aug_users_r):
+        # calcrate ssl-loss(InfoNCE)
+        loss = InfoNCE(negative_mode='unpaired')
+
+        query = users_r
+        positive_key = aug_users_r
+        negative_keys = aug_users_r
+        contrasive_loss = loss(query, positive_key, negative_keys)
+        return contrasive_loss
+
+    def bpr_forward(self, users, pos_items, neg_items):
+        # 普通の埋め込み
+        rep = self.get_def_rep()
+        users_r = rep[users, :]
+        pos_items_r, neg_items_r = rep[self.n_users + pos_items, :], rep[self.n_users + neg_items, :]
+        # AUG後の埋め込み
+        drop_rep = self.get_drop_rep(self.norm_aug_adj)
+        drop_users_r = drop_rep[users, :]
+        aug_rep = self.get_aug_rep(self.norm_aug_adj)
+        aug_users_r = aug_rep[users, :]
+        l2_norm_sq = torch.norm(users_r, p=2, dim=1) ** 2 + torch.norm(pos_items_r, p=2, dim=1) ** 2 \
+                     + torch.norm(neg_items_r, p=2, dim=1) ** 2
+        # Contrasive loss
+        contrasive_loss1 = self.cal_loss(users_r, aug_users_r)
+        contrasive_loss2 = self.cal_loss(users_r, drop_users_r)
+
+        contrasive_loss = contrasive_loss1 + contrasive_loss2
+        return users_r, pos_items_r, neg_items_r, l2_norm_sq, contrasive_loss
+
+    def predict(self, users):
+        rep = self.get_def_rep()
+        users_r = rep[users, :]
+        all_items_r = rep[self.n_users:, :]
+        scores = torch.mm(users_r, all_items_r.t())
+        return scores
+    def update_aug_adj(self):
+        del self.norm_aug_adj,  self.norm_drop_adj
+        torch.cuda.empty_cache()
+        # gc.collect()
+        # self.norm_adj = self.generate_drop_graph()
+        self.norm_aug_adj = self.generate_aug_graph(self.config['dataset'])
+        self.norm_drop_adj = self.generate_drop_graph(self.config['dataset'])
+
+    def save(self, path):
+        params = {'sate_dict': self.state_dict(), 'user_map': self.user_map,
+                  'item_map': self.item_map, 'alpha': self.alpha}
+        torch.save(params, path)
+
+    def load(self, path):
+        params = torch.load(path, map_location=self.device)
+        self.load_state_dict(params['sate_dict'])
+        self.user_map = params['user_map']
+        self.item_map = params['item_map']
+        self.alpha = params['alpha']
+        self.feat_mat, _, _, self.row_sum = self.generate_feat(self.config['dataset'], is_updating=True)
+        self.update_feat_mat()
+
+
+
+class DOSE_aug_drop2(BasicModel):
+    def __init__(self, model_config):
+        super(DOSE_aug_drop2, self).__init__(model_config)
+        self.embedding_size = model_config['embedding_size']
+        self.n_layers = model_config['n_layers']
+        self.dropout = model_config['dropout']
+        self.feature_ratio = model_config['feature_ratio']  # Template%
+        self.norm_adj = self.generate_graph(model_config['dataset'])
+
+        self.alpha = 1.
+        self.delta = model_config.get('delta', 0.99)
+        self.taugh = model_config.get('taugh', 0.2)
+        self.aug_ratio = model_config.get('aug_ratio', 0.2)
+        self.aug_num = model_config['aug_num']
+        # self.temper = model_config['temper']
+        self.feat_mat, self.user_map, self.item_map, self.row_sum = \
+            self.generate_feat(model_config['dataset'],
+                               ranking_metric=model_config.get('ranking_metric', 'sort'))
+        self.update_feat_mat()
+        # self.norm_aug_adj = generate_aug_graph(model_config['dataset'] )
+        self.embedding = nn.Embedding(self.feat_mat.shape[1], self.embedding_size)
+
+        self.w = nn.Parameter(torch.ones([self.embedding_size], dtype=torch.float32, device=self.device))
+        normal_(self.embedding.weight, std=0.1)
+        self.to(device=self.device)
+        self.norm_aug_adj = self.generate_aug_graph(model_config['dataset'])
+        self.norm_drop_adj = self.generate_drop_graph(model_config['dataset'])
+        self.times = model_config.get('times', 0.1)
+        # self.aug_num = (self.times) * len(self.feat_mat)
+
+    def update_feat_mat(self):
+        row, _ = self.feat_mat.indices()
+        edge_values = torch.pow(self.row_sum[row], (self.alpha - 1.) / 2. - 0.5)
+        self.feat_mat = torch.sparse.FloatTensor(self.feat_mat.indices(), edge_values, self.feat_mat.shape).coalesce()
+
+    def feat_mat_anneal(self):
+        self.alpha *= self.delta
+        self.update_feat_mat()
+
+    def generate_graph(self, dataset):
+        return LightGCN.generate_graph(self, dataset)
+
+    def generate_aug_graph(self, dataset):
+        # new graph after adding some interactions
+        aug_idx = self.cal_cos_sim(dataset)
+        aug_adj_mat = generate_aug_daj_mat(dataset, aug_idx)
+        degree = np.array(np.sum(aug_adj_mat, axis=1)).squeeze()
+        degree = np.maximum(1., degree)
+        d_inv = np.power(degree, -0.5) # 累乗
+        d_mat = sp.diags(d_inv, format='csr', dtype=np.float32)
+
+        norm_aug_adj = d_mat.dot(aug_adj_mat).dot(d_mat)
+        norm_aug_adj = get_sparse_tensor(norm_aug_adj, self.device)
+        return norm_aug_adj
+
+
+
+    def generate_drop_graph(self, dataset):
+        # new graph after adding some interactions
+        aug_idx = self.cal_cos_sim(dataset)
+        aug_adj_mat = generate_drop_daj_mat2(dataset, aug_idx)
+        degree = np.array(np.sum(aug_adj_mat, axis=1)).squeeze()
+        degree = np.maximum(1., degree)
+        d_inv = np.power(degree, -0.5) # 累乗
+        d_mat = sp.diags(d_inv, format='csr', dtype=np.float32)
+
+        norm_aug_adj = d_mat.dot(aug_adj_mat).dot(d_mat)
+        norm_aug_adj = get_sparse_tensor(norm_aug_adj, self.device)
+        return norm_aug_adj
+
+    def generate_feat(self, dataset, is_updating=False, ranking_metric=None):
+        # return adj matrix with template
+        if not is_updating:
+            if self.feature_ratio < 1.:  # ランク付後にスライス
+
+                ranked_users, ranked_items = graph_rank_nodes(dataset, ranking_metric)
+                core_users = ranked_users[:int(self.n_users * self.feature_ratio)]
+                core_items = ranked_items[:int(self.n_items * self.feature_ratio)]
+            else:
+                core_users = np.arange(self.n_users, dtype=np.int64)
+                core_items = np.arange(self.n_items, dtype=np.int64)
+
+            user_map = dict()
+            for idx, user in enumerate(core_users):
+                user_map[user] = idx
+            item_map = dict()
+            for idx, item in enumerate(core_items):
+                item_map[item] = idx
+        else:
+            user_map = self.user_map
+            item_map = self.item_map
+
+        user_dim, item_dim = len(user_map), len(item_map)
+        indices = []
+        for user, item in dataset.train_array:
+            if item in item_map:
+                indices.append([user, user_dim + item_map[item]])
+            if user in user_map:
+                indices.append([self.n_users + item, user_map[user]])
+        for user in range(self.n_users):
+            indices.append([user, user_dim + item_dim])
+        for item in range(self.n_items):
+            indices.append([self.n_users + item, user_dim + item_dim + 1])
+        feat = sp.coo_matrix((np.ones((len(indices),)), np.array(indices).T),
+                             shape=(self.n_users + self.n_items, user_dim + item_dim + 2), dtype=np.float32).tocsr()
+        row_sum = torch.tensor(np.array(np.sum(feat, axis=1)).squeeze(), dtype=torch.float32, device=self.device)
+        feat = get_sparse_tensor(feat, self.device)
+        return feat, user_map, item_map, row_sum
+
+    def cal_cos_sim(self, dataset):
+        # calculate cosine similarity with user embeddings and item embeddings (on CPU)
+        ranking_metric = 'degree'
+        ranked_users, ranked_items = graph_rank_nodes(dataset, ranking_metric)
+        core_users = ranked_users[int(self.n_users * self.aug_ratio):]
+        core_items = ranked_items[int(self.n_items * self.aug_ratio):]
+
+        user_map = dict()
+        item_map = dict()
+        n_core_user = len(core_users)
+        n_core_item = len(core_items)
+        for idx, user in enumerate(core_users):
+            user_map[idx] = user
+        for idx, item in enumerate(core_items):
+            item_map[idx] = item
+        rep = self.get_def_rep()
+        aug_users_r = rep[core_users, :]
+        aug_items_r = rep[self.n_users + core_items, :]
+
+        aug_users_r = aug_users_r.to('cpu').detach().numpy().copy()
+        aug_items_r = aug_items_r.to('cpu').detach().numpy().copy()
+
+        x = cosine_similarity(aug_users_r, aug_items_r)
+        cos_mat = torch.from_numpy(x.astype(np.float32)).clone()
+        cos_mat.to(device=self.device)
+        cos_mat = torch.reshape(cos_mat, (1, -1))
+        _, idx = torch.topk(cos_mat, self.aug_num)
+        #print(user_map)
+        #print(item_map)
+        # idx = idx.tolist()S
+        aug_idx = [
+            [user_map[int(torch.div(idx[0][i], n_core_item, rounding_mode='floor'))], item_map[(int(torch.fmod(idx[0][i], n_core_item)))]]
+            for i in range(self.aug_num)]
+
+        return aug_idx  # return list [user_id, item_id]
+
+    def inductive_rep_layer(self, feat_mat):
+        # generate embedding by using template
+        padding_tensor = torch.empty([max(self.feat_mat.shape) - self.feat_mat.shape[1], self.embedding_size],
+                                     dtype=torch.float32, device=self.device)
+        padding_features = torch.cat([self.embedding.weight, padding_tensor], dim=0)
+
+        row, column = feat_mat.indices()
+        g = dgl.graph((column, row), num_nodes=max(self.feat_mat.shape), device=self.device)
+        x = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=padding_features, rhs_data=feat_mat.values())
+        x = x[:self.feat_mat.shape[0], :]
+        return x
+
+    def get_def_rep(self):
+        # generate final embedding
+        feat_mat = NGCF.dropout_sp_mat(self, self.feat_mat)
+        representations = self.inductive_rep_layer(feat_mat)
+
+        all_layer_rep = [representations]
+        row, column = self.norm_adj.indices()
+        g = dgl.graph((column, row), num_nodes=self.norm_adj.shape[0], device=self.device)
+        for _ in range(self.n_layers):
+            representations = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=representations, rhs_data=self.norm_adj.values())
+            all_layer_rep.append(representations)
+        all_layer_rep = torch.stack(all_layer_rep, dim=0)
+        final_rep = all_layer_rep.mean(dim=0)
+        return final_rep
+    
+    def get_aug_rep(self, norm_aug_adj):
+        # generate final embedding
+        feat_mat = NGCF.dropout_sp_mat(self, self.feat_mat)
+        representations = self.inductive_rep_layer(feat_mat)
+
+        all_layer_rep = [representations]
+        row, column = norm_aug_adj.indices()
+        g = dgl.graph((column, row), num_nodes=norm_aug_adj.shape[0], device=self.device)
+        for _ in range(self.n_layers):
+            representations = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=representations, rhs_data=norm_aug_adj.values())
+            all_layer_rep.append(representations)
+        all_layer_rep = torch.stack(all_layer_rep, dim=0)
+        final_rep = all_layer_rep.mean(dim=0)
+        return final_rep
+
+    def get_drop_rep(self, norm_drop_adj):
+        # generate final embedding on aug-graph
+        feat_mat = NGCF.dropout_sp_mat(self, self.feat_mat)
+        representations = self.inductive_rep_layer(feat_mat)
+
+        all_layer_rep = [representations]
+        row, column = norm_drop_adj.indices()
+        g = dgl.graph((column, row), num_nodes=norm_drop_adj.shape[0], device=self.device)
+        for _ in range(self.n_layers):
+            representations = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=representations, rhs_data=norm_drop_adj.values())
+            all_layer_rep.append(representations)
+        all_layer_rep = torch.stack(all_layer_rep, dim=0)
+        final_rep = all_layer_rep.mean(dim=0)
+        return final_rep
+
+    def cal_loss(self, users_r, aug_users_r):
+        # calcrate ssl-loss(InfoNCE)
+        loss = InfoNCE(negative_mode='unpaired')
+
+        query = users_r
+        positive_key = aug_users_r
+        negative_keys = aug_users_r
+        contrasive_loss = loss(query, positive_key, negative_keys)
+        return contrasive_loss
+
+    def bpr_forward(self, users, pos_items, neg_items):
+        # 普通の埋め込み
+        rep = self.get_def_rep()
+        users_r = rep[users, :]
+        pos_items_r, neg_items_r = rep[self.n_users + pos_items, :], rep[self.n_users + neg_items, :]
+        # AUG後の埋め込み
+
+        aug_rep = self.get_drop_rep(self.norm_drop_adj)
+        aug_users_r = aug_rep[users, :]
+        l2_norm_sq = torch.norm(users_r, p=2, dim=1) ** 2 + torch.norm(pos_items_r, p=2, dim=1) ** 2 \
+                     + torch.norm(neg_items_r, p=2, dim=1) ** 2
+        # Contrasive loss
+        contrasive_loss = self.cal_loss(users_r, aug_users_r)
+        return users_r, pos_items_r, neg_items_r, l2_norm_sq, contrasive_loss
+
+    def predict(self, users):
+        rep = self.get_def_rep()
+        users_r = rep[users, :]
+        all_items_r = rep[self.n_users:, :]
+        scores = torch.mm(users_r, all_items_r.t())
+        return scores
+
+    def save(self, path):
+        params = {'sate_dict': self.state_dict(), 'user_map': self.user_map,
+                  'item_map': self.item_map, 'alpha': self.alpha}
+        torch.save(params, path)
+
+    def load(self, path):
+        params = torch.load(path, map_location=self.device)
+        self.load_state_dict(params['sate_dict'])
+        self.user_map = params['user_map']
+        self.item_map = params['item_map']
+        self.alpha = params['alpha']
+        self.feat_mat, _, _, self.row_sum = self.generate_feat(self.config['dataset'], is_updating=True)
+        self.update_feat_mat()
+
+
+class DOSE_aug_drop3(BasicModel):
+    def __init__(self, model_config):
+        super(DOSE_aug_drop3, self).__init__(model_config)
+        self.embedding_size = model_config['embedding_size']
+        self.n_layers = model_config['n_layers']
+        self.dropout = model_config['dropout']
+        self.feature_ratio = model_config['feature_ratio']  # Template%
+        self.norm_adj = self.generate_graph(model_config['dataset'])
+
+        self.alpha = 1.
+        self.delta = model_config.get('delta', 0.99)
+        self.taugh = model_config.get('taugh', 0.2)
+        self.aug_ratio = model_config.get('aug_ratio', 0.2)
+        self.aug_num = model_config['aug_num']
+        # self.temper = model_config['temper']
+        self.feat_mat, self.user_map, self.item_map, self.row_sum = \
+            self.generate_feat(model_config['dataset'],
+                               ranking_metric=model_config.get('ranking_metric', 'sort'))
+        self.update_feat_mat()
+        # self.norm_aug_adj = generate_aug_graph(model_config['dataset'] )
+        self.embedding = nn.Embedding(self.feat_mat.shape[1], self.embedding_size)
+
+        self.w = nn.Parameter(torch.ones([self.embedding_size], dtype=torch.float32, device=self.device))
+        normal_(self.embedding.weight, std=0.1)
+        self.to(device=self.device)
+        self.norm_aug_adj = self.generate_aug_graph(model_config['dataset'])
+        self.norm_drop_adj = self.generate_drop_graph(model_config['dataset'])
+        self.times = model_config.get('times', 0.1)
+        # self.aug_num = (self.times) * len(self.feat_mat)
+
+    def update_feat_mat(self):
+        row, _ = self.feat_mat.indices()
+        edge_values = torch.pow(self.row_sum[row], (self.alpha - 1.) / 2. - 0.5)
+        self.feat_mat = torch.sparse.FloatTensor(self.feat_mat.indices(), edge_values, self.feat_mat.shape).coalesce()
+
+    def feat_mat_anneal(self):
+        self.alpha *= self.delta
+        self.update_feat_mat()
+
+    def generate_graph(self, dataset):
+        return LightGCN.generate_graph(self, dataset)
+
+    def generate_aug_graph(self, dataset):
+        # new graph after adding some interactions
+        aug_idx = self.cal_cos_sim()
+        aug_adj_mat = generate_aug_daj_mat(dataset, aug_idx)
+        degree = np.array(np.sum(aug_adj_mat, axis=1)).squeeze()
+        degree = np.maximum(1., degree)
+        d_inv = np.power(degree, -0.5)  # 累乗
+        d_mat = sp.diags(d_inv, format='csr', dtype=np.float32)
+
+        norm_aug_adj = d_mat.dot(aug_adj_mat).dot(d_mat)
+        norm_aug_adj = get_sparse_tensor(norm_aug_adj, self.device)
+        return norm_aug_adj
+
+    def generate_drop_graph(self, dataset):
+        # new graph after adding some interactions
+        aug_idx = self.cal_cos_sim()
+        aug_adj_mat = generate_drop_daj_mat3(dataset, aug_idx)
+        degree = np.array(np.sum(aug_adj_mat, axis=1)).squeeze()
+        degree = np.maximum(1., degree)
+        d_inv = np.power(degree, -0.5)  # 累乗
+        d_mat = sp.diags(d_inv, format='csr', dtype=np.float32)
+
+        norm_aug_adj = d_mat.dot(aug_adj_mat).dot(d_mat)
+        norm_aug_adj = get_sparse_tensor(norm_aug_adj, self.device)
+        return norm_aug_adj
+
+    def generate_feat(self, dataset, is_updating=False, ranking_metric=None):
+        # return adj matrix with template
+        if not is_updating:
+            if self.feature_ratio < 1.:  # ランク付後にスライス
+
+                ranked_users, ranked_items = graph_rank_nodes(dataset, ranking_metric)
+                core_users = ranked_users[:int(self.n_users * self.feature_ratio)]
+                core_items = ranked_items[:int(self.n_items * self.feature_ratio)]
+            else:
+                core_users = np.arange(self.n_users, dtype=np.int64)
+                core_items = np.arange(self.n_items, dtype=np.int64)
+
+            user_map = dict()
+            for idx, user in enumerate(core_users):
+                user_map[user] = idx
+            item_map = dict()
+            for idx, item in enumerate(core_items):
+                item_map[item] = idx
+        else:
+            user_map = self.user_map
+            item_map = self.item_map
+
+        user_dim, item_dim = len(user_map), len(item_map)
+        indices = []
+        for user, item in dataset.train_array:
+            if item in item_map:
+                indices.append([user, user_dim + item_map[item]])
+            if user in user_map:
+                indices.append([self.n_users + item, user_map[user]])
+        for user in range(self.n_users):
+            indices.append([user, user_dim + item_dim])
+        for item in range(self.n_items):
+            indices.append([self.n_users + item, user_dim + item_dim + 1])
+        feat = sp.coo_matrix((np.ones((len(indices),)), np.array(indices).T),
+                             shape=(self.n_users + self.n_items, user_dim + item_dim + 2), dtype=np.float32).tocsr()
+        row_sum = torch.tensor(np.array(np.sum(feat, axis=1)).squeeze(), dtype=torch.float32, device=self.device)
+        feat = get_sparse_tensor(feat, self.device)
+        return feat, user_map, item_map, row_sum
+
+    def cal_cos_sim(self):
+        # calculate cosine similarity with user embeddings and item embeddings (on CPU)
+        rep = self.get_def_rep()
+        all_users_r = rep[:self.n_users, :]
+        all_items_r = rep[self.n_users:, :]
+
+        all_users_r = all_users_r.to('cpu').detach().numpy().copy()
+        all_items_r = all_items_r.to('cpu').detach().numpy().copy()
+
+        x = cosine_similarity(all_users_r, all_items_r)
+        cos_mat = torch.from_numpy(x.astype(np.float32)).clone()
+        cos_mat.to(device=self.device)
+        cos_sim = torch.reshape(cos_mat, (1, -1))
+        _, idx = torch.topk(cos_sim, self.aug_num)
+        # idx = idx.tolist()S
+        aug_idx = [
+            [int(torch.div(idx[0][i], self.n_items, rounding_mode='floor')), (int(torch.fmod(idx[0][i], self.n_items)))]
+            for i in range(self.aug_num)]
+
+        return aug_idx  # return list [user_id, item_id]
+
+    def inductive_rep_layer(self, feat_mat):
+        # generate embedding by using template
+        padding_tensor = torch.empty([max(self.feat_mat.shape) - self.feat_mat.shape[1], self.embedding_size],
+                                     dtype=torch.float32, device=self.device)
+        padding_features = torch.cat([self.embedding.weight, padding_tensor], dim=0)
+
+        row, column = feat_mat.indices()
+        g = dgl.graph((column, row), num_nodes=max(self.feat_mat.shape), device=self.device)
+        x = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=padding_features, rhs_data=feat_mat.values())
+        x = x[:self.feat_mat.shape[0], :]
+        return x
+
+    def get_def_rep(self):
+        # generate final embedding
+        feat_mat = NGCF.dropout_sp_mat(self, self.feat_mat)
+        representations = self.inductive_rep_layer(feat_mat)
+
+        all_layer_rep = [representations]
+        row, column = self.norm_adj.indices()
+        g = dgl.graph((column, row), num_nodes=self.norm_adj.shape[0], device=self.device)
+        for _ in range(self.n_layers):
+            representations = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=representations, rhs_data=self.norm_adj.values())
+            all_layer_rep.append(representations)
+        all_layer_rep = torch.stack(all_layer_rep, dim=0)
+        final_rep = all_layer_rep.mean(dim=0)
+        return final_rep
+
+    def get_aug_rep(self, norm_aug_adj):
+        # generate final embedding
+        feat_mat = NGCF.dropout_sp_mat(self, self.feat_mat)
+        representations = self.inductive_rep_layer(feat_mat)
+
+        all_layer_rep = [representations]
+        row, column = norm_aug_adj.indices()
+        g = dgl.graph((column, row), num_nodes=norm_aug_adj.shape[0], device=self.device)
+        for _ in range(self.n_layers):
+            representations = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=representations, rhs_data=norm_aug_adj.values())
+            all_layer_rep.append(representations)
+        all_layer_rep = torch.stack(all_layer_rep, dim=0)
+        final_rep = all_layer_rep.mean(dim=0)
+        return final_rep
+
+    def get_drop_rep(self, norm_drop_adj):
+        # generate final embedding on aug-graph
+        feat_mat = NGCF.dropout_sp_mat(self, self.feat_mat)
+        representations = self.inductive_rep_layer(feat_mat)
+
+        all_layer_rep = [representations]
+        row, column = norm_drop_adj.indices()
+        g = dgl.graph((column, row), num_nodes=norm_drop_adj.shape[0], device=self.device)
+        for _ in range(self.n_layers):
+            representations = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=representations, rhs_data=norm_drop_adj.values())
+            all_layer_rep.append(representations)
+        all_layer_rep = torch.stack(all_layer_rep, dim=0)
+        final_rep = all_layer_rep.mean(dim=0)
+        return final_rep
+
+    def cal_loss(self, users_r, aug_users_r):
+        # calcrate ssl-loss(InfoNCE)
+        loss = InfoNCE(negative_mode='unpaired')
+
+        query = users_r
+        positive_key = aug_users_r
+        negative_keys = aug_users_r
+        contrasive_loss = loss(query, positive_key, negative_keys)
+        return contrasive_loss
+
+    def bpr_forward(self, users, pos_items, neg_items):
+        # 普通の埋め込み
+        rep = self.get_def_rep()
+        users_r = rep[users, :]
+        pos_items_r, neg_items_r = rep[self.n_users + pos_items, :], rep[self.n_users + neg_items, :]
+        # AUG後の埋め込み
+
+        aug_rep = self.get_drop_rep(self.norm_drop_adj)
+        aug_users_r = aug_rep[users, :]
+        l2_norm_sq = torch.norm(users_r, p=2, dim=1) ** 2 + torch.norm(pos_items_r, p=2, dim=1) ** 2 \
+                     + torch.norm(neg_items_r, p=2, dim=1) ** 2
+        # Contrasive loss
+        contrasive_loss = self.cal_loss(users_r, aug_users_r)
+        return users_r, pos_items_r, neg_items_r, l2_norm_sq, contrasive_loss
+
+    def predict(self, users):
+        rep = self.get_def_rep()
+        users_r = rep[users, :]
+        all_items_r = rep[self.n_users:, :]
+        scores = torch.mm(users_r, all_items_r.t())
+        return scores
+
+    def save(self, path):
+        params = {'sate_dict': self.state_dict(), 'user_map': self.user_map,
+                  'item_map': self.item_map, 'alpha': self.alpha}
+        torch.save(params, path)
+
+    def load(self, path):
+        params = torch.load(path, map_location=self.device)
+        self.load_state_dict(params['sate_dict'])
+        self.user_map = params['user_map']
+        self.item_map = params['item_map']
+        self.alpha = params['alpha']
+        self.feat_mat, _, _, self.row_sum = self.generate_feat(self.config['dataset'], is_updating=True)
+        self.update_feat_mat()
+
+
+class DOSE_test(BasicModel):
+    def __init__(self, model_config):
+        super(DOSE_test, self).__init__(model_config)
+        self.embedding_size = model_config['embedding_size']
+        self.n_layers = model_config['n_layers']
+        self.dropout = model_config['dropout']
+        self.feature_ratio = model_config['feature_ratio']  # Template%
+        self.norm_adj = self.generate_graph(model_config['dataset'])
+
+        self.alpha = 1.
+        self.delta = model_config.get('delta', 0.99)
+        self.taugh = model_config.get('taugh', 0.2)
+        self.aug_num = model_config['aug_num']
+        # self.temper = model_config['temper']
+        self.feat_mat, self.user_map, self.item_map, self.row_sum = \
+            self.generate_feat(model_config['dataset'],
+                               ranking_metric=model_config.get('ranking_metric', 'sort'))
+        self.update_feat_mat()
+        # self.norm_aug_adj = enerate_aug_graph(model_config['dataset'] )
+        self.embedding = nn.Embedding(self.feat_mat.shape[1], self.embedding_size)
+
+        self.w = nn.Parameter(torch.ones([self.embedding_size], dtype=torch.float32, device=self.device))
+        normal_(self.embedding.weight, std=0.1)
+        self.to(device=self.device)
+        self.norm_aug_adj = self.generate_aug_graph(model_config['dataset'])
+        self.times = model_config.get('times', 0.1)
+        # self.aug_num = (self.times) * len(self.feat_mat)
+
+    def update_feat_mat(self):
+        row, _ = self.feat_mat.indices()
+        edge_values = torch.pow(self.row_sum[row], (self.alpha - 1.) / 2. - 0.5)
+        self.feat_mat = torch.sparse.FloatTensor(self.feat_mat.indices(), edge_values, self.feat_mat.shape).coalesce()
+
+    def feat_mat_anneal(self):
+        self.alpha *= self.delta
+        self.update_feat_mat()
+
+    def generate_graph(self, dataset):
+        return LightGCN.generate_graph(self, dataset)
+
+    def generate_aug_graph(self, dataset):
+        # new graph after adding some interactions
+        aug_idx = self.cal_cos_sim()
+        aug_adj_mat = generate_aug_daj_mat(dataset, aug_idx)
+        degree = np.array(np.sum(aug_adj_mat, axis=1)).squeeze()
+        degree = np.maximum(1., degree)
+        d_inv = np.power(degree, -0.5)  # 累乗
+        d_mat = sp.diags(d_inv, format='csr', dtype=np.float32)
+
+        norm_aug_adj = d_mat.dot(aug_adj_mat).dot(d_mat)
+        norm_aug_adj = get_sparse_tensor(norm_aug_adj, self.device)
+        return norm_aug_adj
+
+    def generate_feat(self, dataset, is_updating=False, ranking_metric=None):
+        # return adj matrix with template
+        if not is_updating:
+            if self.feature_ratio < 1.:  # ランク付後にスライス
+
+                ranked_users, ranked_items = graph_rank_nodes(dataset, ranking_metric)
+                core_users = ranked_users[:int(self.n_users * self.feature_ratio)]
+                core_items = ranked_items[:int(self.n_items * self.feature_ratio)]
+            else:
+                core_users = np.arange(self.n_users, dtype=np.int64)
+                core_items = np.arange(self.n_items, dtype=np.int64)
+
+            user_map = dict()
+            for idx, user in enumerate(core_users):
+                user_map[user] = idx
+            item_map = dict()
+            for idx, item in enumerate(core_items):
+                item_map[item] = idx
+        else:
+            user_map = self.user_map
+            item_map = self.item_map
+
+        user_dim, item_dim = len(user_map), len(item_map)
+        indices = []
+        for user, item in dataset.train_array:
+            if item in item_map:
+                indices.append([user, user_dim + item_map[item]])
+            if user in user_map:
+                indices.append([self.n_users + item, user_map[user]])
+        for user in range(self.n_users):
+            indices.append([user, user_dim + item_dim])
+        for item in range(self.n_items):
+            indices.append([self.n_users + item, user_dim + item_dim + 1])
+        feat = sp.coo_matrix((np.ones((len(indices),)), np.array(indices).T),
+                             shape=(self.n_users + self.n_items, user_dim + item_dim + 2), dtype=np.float32).tocsr()
+        row_sum = torch.tensor(np.array(np.sum(feat, axis=1)).squeeze(), dtype=torch.float32, device=self.device)
+        feat = get_sparse_tensor(feat, self.device)
+        return feat, user_map, item_map, row_sum
+
+    def inductive_rep_layer(self, feat_mat):
+        padding_tensor = torch.empty([max(self.feat_mat.shape) - self.feat_mat.shape[1], self.embedding_size],
+                                     dtype=torch.float32, device=self.device)
+        padding_features = torch.cat([self.embedding.weight, padding_tensor], dim=0)
+
+        row, column = feat_mat.indices()
+        g = dgl.graph((column, row), num_nodes=max(self.feat_mat.shape), device=self.device)
+        x = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=padding_features, rhs_data=feat_mat.values())
+        x = x[:self.feat_mat.shape[0], :]
+        return x
+
+    def get_def_rep(self):
+        # generate final embedding
+        feat_mat = NGCF.dropout_sp_mat(self, self.feat_mat)
+        representations = self.inductive_rep_layer(feat_mat)
+
+        all_layer_rep = [representations]
+        row, column = self.norm_adj.indices()
+        g = dgl.graph((column, row), num_nodes=self.norm_adj.shape[0], device=self.device)
+        for _ in range(self.n_layers):
+            representations = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=representations, rhs_data=self.norm_adj.values())
+            all_layer_rep.append(representations)
+        all_layer_rep = torch.stack(all_layer_rep, dim=0)
+        final_rep = all_layer_rep.mean(dim=0)
+        return final_rep
+
+    def get_aug_rep(self, norm_aug_adj):
+        # generate final embedding on aug-graph
+        feat_mat = NGCF.dropout_sp_mat(self, self.feat_mat)
+        representations = self.inductive_rep_layer(feat_mat)
+
+        all_layer_rep = [representations]
+        row, column = norm_aug_adj.indices()
+        g = dgl.graph((column, row), num_nodes=norm_aug_adj.shape[0], device=self.device)
+        for _ in range(self.n_layers):
+            representations = dgl.ops.gspmm(g, 'mul', 'sum', lhs_data=representations, rhs_data=norm_aug_adj.values())
+            all_layer_rep.append(representations)
+        all_layer_rep = torch.stack(all_layer_rep, dim=0)
+        final_rep = all_layer_rep.mean(dim=0)
+        return final_rep
+
+    def cal_cos_sim(self):
+        # calculate cosine similarity with user embeddings and item embeddings (on CPU)
+        rep = self.get_def_rep()
+        all_users_r = rep[:self.n_users, :]
+        all_items_r = rep[self.n_users:, :]
+
+        all_users_r = all_users_r.to('cpu').detach().numpy().copy()
+        all_items_r = all_items_r.to('cpu').detach().numpy().copy()
+
+        x = cosine_similarity(all_users_r, all_items_r)
+        cos_mat = torch.from_numpy(x.astype(np.float32)).clone()
+        cos_mat.to(device=self.device)
+        cos_sim = torch.reshape(cos_mat, (1, -1))
+        _, idx = torch.topk(cos_sim, self.aug_num)
+        # idx = idx.tolist()S
+        aug_idx = [
+            [int(torch.div(idx[0][i], self.n_items, rounding_mode='floor')), (int(torch.fmod(idx[0][i], self.n_items)))]
+            for i in range(self.aug_num)]
+
+        return aug_idx  # return list [user_id, item_id]
+
+    def cal_cos_sim_v2(self):
+        # calculate cosine similarity with user embeddings and item embeddings (on GPU)
+        rep = self.get_def_rep()
+        all_users_r = rep[:self.n_users, :]
+        all_items_r = rep[self.n_users:, :]
+
+        cos_sim = pairwise_cosine_similarity(all_users_r, all_items_r)
+        cos_sim = torch.reshape(cos_sim, (1, -1))
+        _, idx = torch.topk(cos_sim, self.aug_num)
+        aug_idx = [
+            [int(torch.div(idx[0][i], self.n_items, rounding_mode='floor')), (int(torch.fmod(idx[0][i], self.n_items)))]
+            for i in range(self.aug_num)]
+
+        return aug_idx  # return list [user_id, item_id]
+
+    def cal_loss(self, users_r, aug_users_r):
+        # calcrate ssl-loss(InfoNCE)
+        loss = InfoNCE(negative_mode='paired')
+
+        query = users_r
+        positive_key = aug_users_r
+        negative_keys = aug_users_r.unsqueeze(1)
+
+        contrasive_loss = loss(query, positive_key, negative_keys)
+        return contrasive_loss
+
+    def bpr_forward(self, users, pos_items, neg_items):
+        # 普通の埋め込み
+        rep = self.get_def_rep()
+        users_r = rep[users, :]
+        aug_rep = self.get_aug_rep(self.norm_aug_adj)
+        aug_users_r = aug_rep[users, :]
+        pos_items_r, neg_items_r = rep[self.n_users + pos_items, :], rep[self.n_users + neg_items, :]
+        # AUG後の埋め込み
+
+        l2_norm_sq = torch.norm(users_r, p=2, dim=1) ** 2 + torch.norm(pos_items_r, p=2, dim=1) ** 2 \
+                     + torch.norm(neg_items_r, p=2, dim=1) ** 2
+
+        return users_r, pos_items_r, neg_items_r, l2_norm_sq, aug_users_r
+
+    def predict(self, users):
+        rep = self.get_def_rep()
+        users_r = rep[users, :]
+        all_items_r = rep[self.n_users:, :]
+        scores = torch.mm(users_r, all_items_r.t())
+        return scores
+
+    def save(self, path):
+        params = {'sate_dict': self.state_dict(), 'user_map': self.user_map,
+                  'item_map': self.item_map, 'alpha': self.alpha}
+        torch.save(params, path)
+
+    def load(self, path):
+        params = torch.load(path, map_location=self.device)
+        self.load_state_dict(params['sate_dict'])
+        self.user_map = params['user_map']
+        self.item_map = params['item_map']
+        self.alpha = params['alpha']
+        self.feat_mat, _, _, self.row_sum = self.generate_feat(self.config['dataset'], is_updating=True)
+        self.update_feat_mat()
 
 
 class RelationGAT(nn.Module):
@@ -357,7 +4082,7 @@ class IGCN(BasicModel):
         self.embedding_size = model_config['embedding_size']
         self.n_layers = model_config['n_layers']
         self.dropout = model_config['dropout']
-        self.feature_ratio = model_config['feature_ratio']
+        self.feature_ratio = model_config['feature_ratio']  # Template%
         self.norm_adj = self.generate_graph(model_config['dataset'])
         self.alpha = 1.
         self.delta = model_config.get('delta', 0.99)
@@ -385,7 +4110,8 @@ class IGCN(BasicModel):
 
     def generate_feat(self, dataset, is_updating=False, ranking_metric=None):
         if not is_updating:
-            if self.feature_ratio < 1.:
+            if self.feature_ratio < 1.:  # ランク付後にスライス
+
                 ranked_users, ranked_items = graph_rank_nodes(dataset, ranking_metric)
                 core_users = ranked_users[:int(self.n_users * self.feature_ratio)]
                 core_items = ranked_items[:int(self.n_items * self.feature_ratio)]
