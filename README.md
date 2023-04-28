@@ -1,11 +1,3 @@
-# INMO: Inductive Embedding Module for CF
-
-This is our official implementation for the paper:
-
-Yunfan Wu, Qi Cao, Huawei Shen, Shuchang Tao & Xueqi Cheng. 2022. **INMO: A Model-Agnostic and Scalable Module for Inductive
-Collaborative Filtering**  , In *Proceedings of SIGIR'22*. 
-
-This paper is available in [ACM digital library](https://dl.acm.org/doi/abs/10.1145/3477495.3532000).
 
 ## Environment
 
