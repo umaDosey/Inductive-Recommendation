@@ -568,6 +568,11 @@ class DOSE_aug(BasicModel):
         negative_keys = aug_users_r
         contrasive_loss = loss(query, positive_key, negative_keys)
         return contrasive_loss
+    def update_aug_adj(self):
+        del self.norm_aug_adj
+        torch.cuda.empty_cache()
+        # gc.collect()
+        self.norm_aug_adj = self.generate_drop_graph(self.config['dataset'])
 
     def bpr_forward(self, users, pos_items, neg_items):
         # 普通の埋め込み
@@ -1067,6 +1072,11 @@ class DOSE_aug2(BasicModel):
         negative_keys = aug_users_r
         contrasive_loss = loss(query, positive_key, negative_keys)
         return contrasive_loss
+    def update_aug_adj(self):
+        del self.norm_aug_adj
+        torch.cuda.empty_cache()
+        # gc.collect()
+        self.norm_aug_adj = self.generate_drop_graph(self.config['dataset'])
 
     def bpr_forward(self, users, pos_items, neg_items):
         # 普通の埋め込み
@@ -1295,6 +1305,11 @@ class DOSE_aug3(BasicModel):
         negative_keys = aug_users_r
         contrasive_loss = loss(query, positive_key, negative_keys)
         return contrasive_loss
+    def update_aug_adj(self):
+        del self.norm_aug_adj
+        torch.cuda.empty_cache()
+        # gc.collect()
+        self.norm_aug_adj = self.generate_drop_graph(self.config['dataset'])
 
     def bpr_forward(self, users, pos_items, neg_items):
         # 普通の埋め込み

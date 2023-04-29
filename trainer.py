@@ -11,7 +11,7 @@ import scipy.sparse as sp
 from dataset import AuxiliaryDataset
 import csv
 from info_nce import InfoNCE
-prot_path = '../Result/k_prot.csv'
+
 
 def get_trainer(config, dataset, model):
     config = config.copy()
@@ -192,7 +192,7 @@ class BasicTrainer:
             prot_ndcg += '{:.3f}'.format(metrics['NDCG'][k] * 100.)
 
         prot_results = [prot_precison, prot_recall, prot_ndcg]
-        """
+        
         if val_or_test == 'test':
             header = ['Precision', 'Recall', 'NDCG']
             with open(prot_path, 'w') as file:
@@ -206,7 +206,7 @@ class BasicTrainer:
                     prot_ndcg = (metrics['NDCG'][k] * 100.)
                     prot_result = [prot_precison, prot_recall, prot_ndcg]
                     writer.writerow(prot_result)
-            
+        """
         return results, metrics, prot_results
 
     def inductive_eval(self, n_old_users, n_old_items):
@@ -296,6 +296,7 @@ class DOSEaugTrainer(BasicTrainer):
             #print(consumed_time1)
 
         self.model.feat_mat_anneal()
+        self.model.update_aug_adj()
         # del self.model.norm_aug_adj
 
         torch.cuda.empty_cache()
@@ -454,7 +455,7 @@ class SGLTrainer(BasicTrainer):
             loss.backward()
             self.opt.step()
             losses.update(loss.item(), inputs.shape[0])
-            self.model.update_aug_adj()
+        self.model.update_aug_adj()
         return losses.avg
 class HALFTrainer(BasicTrainer):
     def __init__(self, trainer_config):
@@ -482,7 +483,7 @@ class HALFTrainer(BasicTrainer):
             loss.backward()
             self.opt.step()
             losses.update(loss.item(), inputs.shape[0])
-            self.model.update_aug_adj()
+        self.model.update_aug_adj()
         return losses.avg
 class IDCFTrainer(BasicTrainer):
     def __init__(self, trainer_config):
