@@ -245,6 +245,7 @@ class SGL(BasicModel):
 
 class HALF(BasicModel):
     def __init__(self, model_config):
+        # 片方だけData Augmentation
         super(HALF, self).__init__(model_config)
         self.embedding_size = model_config['embedding_size']
         self.n_layers = model_config['n_layers']
@@ -365,6 +366,7 @@ class HALF(BasicModel):
 
 class DOSE_aug(BasicModel):
     def __init__(self, model_config):
+        # コサイン類似度が低ペアを追加
         super(DOSE_aug, self).__init__(model_config)
         self.embedding_size = model_config['embedding_size']
         self.n_layers = model_config['n_layers']
@@ -500,13 +502,15 @@ class DOSE_aug(BasicModel):
 
     def cal_cos_sim(self):
         # calculate cosine similarity with user embeddings and item embeddings (on CPU)
+
         rep = self.get_def_rep()
         all_users_r = rep[:self.n_users, :]
         all_items_r = rep[self.n_users:, :]
-        
+        all_items_r *= -1
+
         all_user_r = all_users_r.to('cpu').detach().numpy().copy()
         all_item_r = all_items_r.to('cpu').detach().numpy().copy()
-        
+
         x = cosine_similarity(all_user_r, all_item_r)
 
         del all_users_r, all_items_r
@@ -517,23 +521,27 @@ class DOSE_aug(BasicModel):
         cos_mat.to(device=self.device)
         cos_mat = torch.reshape(cos_mat, (1, -1))
         cos_mat = torch.squeeze(cos_mat)
-        cos_mat1 = cos_mat[:len(cos_mat)//2]
-        _, idx1 = torch.topk(cos_mat1, self.aug_num//2)
-        cos_mat2 = cos_mat[len(cos_mat)//2:]
+        cos_mat1 = cos_mat[:len(cos_mat) // 2]
+        _, idx1 = torch.topk(cos_mat1, self.aug_num // 2)
+        cos_mat2 = cos_mat[len(cos_mat) // 2:]
 
         del cos_mat
         torch.cuda.empty_cache()
         # gc.collect()
         print(len(cos_mat2))
-        _, idx2 = torch.topk(cos_mat2, self.aug_num//2)
-        #idx = idx.tolist()S
+        _, idx2 = torch.topk(cos_mat2, self.aug_num // 2)
+        # idx = idx.tolist()S
         aug_idx1 = [[int(torch.div(idx1[i], self.n_items, rounding_mode='floor')),
-                     (int(torch.fmod(idx1[i], self.n_items)))] for i in range(self.aug_num//2)]
+                     (int(torch.fmod(idx1[i], self.n_items)))] for i in range(self.aug_num // 2)]
         # aug_idx.to(device=self.device)
         aug_idx2 = [
-            [int(torch.div(idx2[i]+self.aug_num//2, self.n_items, rounding_mode='floor')), (int(torch.fmod(idx2[i]+self.aug_num//2, self.n_items)))] for i
-            in range(self.aug_num//2)]
+            [int(torch.div(idx2[i] + self.aug_num // 2, self.n_items, rounding_mode='floor')),
+             (int(torch.fmod(idx2[i] + self.aug_num // 2, self.n_items)))] for i
+            in range(self.aug_num // 2)]
         aug_idx1.extend(aug_idx2)
+        del aug_idx2, idx1, idx2
+        torch.cuda.empty_cache()
+
         return aug_idx1  # return list [user_id, item_id]
     
     def cal_cos_sim_v2(self):
@@ -817,6 +825,7 @@ class DOSE_aug4(BasicModel):
 
 class DOSE_aug2(BasicModel):
     def __init__(self, model_config):
+        # コサイン類似度が大きいペアを追加
         super(DOSE_aug2, self).__init__(model_config)
         self.embedding_size = model_config['embedding_size']
         self.n_layers = model_config['n_layers']
@@ -1100,6 +1109,7 @@ class DOSE_aug2(BasicModel):
 
 class DOSE_aug3(BasicModel):
     def __init__(self, model_config):
+        # ランダムに追加
         super(DOSE_aug3, self).__init__(model_config)
         self.embedding_size = model_config['embedding_size']
         self.n_layers = model_config['n_layers']
@@ -1325,6 +1335,7 @@ class DOSE_aug3(BasicModel):
 
 class DOSE_drop(BasicModel):
     def __init__(self, model_config):
+        # コサイン類似度が大きいペアを削除
         super(DOSE_drop, self).__init__(model_config)
         self.embedding_size = model_config['embedding_size']
         self.n_layers = model_config['n_layers']
@@ -1646,6 +1657,7 @@ class DOSE_drop(BasicModel):
 
 class DOSE_drop2(BasicModel):
     def __init__(self, model_config):
+        # ランダムに削除
         super(DOSE_drop2, self).__init__(model_config)
         self.embedding_size = model_config['embedding_size']
         self.n_layers = model_config['n_layers']
@@ -2516,6 +2528,7 @@ class TEST2(BasicModel):
         self.update_feat_mat()
 class DOSE_drop3(BasicModel):
     def __init__(self, model_config):
+        # コサイン類似度が低いペアを削除
         super(DOSE_drop3, self).__init__(model_config)
         self.embedding_size = model_config['embedding_size']
         self.n_layers = model_config['n_layers']
